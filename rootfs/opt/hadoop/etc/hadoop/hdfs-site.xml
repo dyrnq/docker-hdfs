@@ -9,6 +9,29 @@
 
     <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/__HDFS_HOSTNAME__@__KRB5_REALM__</value></property>
     <property><name>dfs.datanode.keytab.file</name><value>/etc/hadoop/hdfs.keytab</value></property>
+    <!--
+        dfs.datanode.hostname: the address the DataNode registers
+        with the NameNode (advertised as ip_addr / host:port in
+        dfsadmin -report, returned to clients in block-location
+        lookups). Without this, the DataNode auto-detects its IP at
+        startup, which in container runtimes (Docker, k8s) almost
+        always resolves to 127.0.0.1; clients then receive
+        127.0.0.1:9866, which from inside another pod is their own
+        loopback and breaks every cross-pod HDFS operation (CSI
+        mounts, distcp, etc.). Pin it to __HDFS_HOSTNAME__ (the
+        entrypoint substitutes this from the same env that already
+        drives fs.defaultFS, the Kerberos principal, and the TLS
+        cert CN) so the registered address stays consistent with
+        the principal, the cert, and what the consumer uses to
+        reach the cluster. Caveat: HDFS_HOSTNAME must be resolvable
+        from both the NameNode and every consumer (single-container
+        mode is fine; in k8s use the pod FQDN or a Service
+        DNS name). Consumers also need
+        dfs.client.use.datanode.hostname=true in their own
+        core-site.xml to use this hostname rather than fall back to
+        the still-127.0.0.1 IP.
+    -->
+    <property><name>dfs.datanode.hostname</name><value>__HDFS_HOSTNAME__</value></property>
     <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
     <property><name>dfs.datanode.http.address</name><value>0.0.0.0:9864</value></property>
     <property><name>dfs.datanode.https.address</name><value>0.0.0.0:9865</value></property>
