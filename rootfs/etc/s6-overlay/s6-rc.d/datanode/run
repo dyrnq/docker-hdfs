@@ -1,0 +1,37 @@
+#!/usr/bin/with-contenv bash
+set -e
+
+# JAVA_HOME is set per-base in the Dockerfile; this fallback only
+# runs if the env is stripped.
+export JAVA_HOME="${JAVA_HOME:?JAVA_HOME must be set by the Dockerfile}"
+export HADOOP_HOME="${HADOOP_HOME:-/opt/hadoop}"
+export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.conf=/etc/krb5.conf"
+
+: "${HDFS_HOSTNAME:=localhost}"
+: "${HDFS_NAMENODE_RPC_PORT:=8020}"
+# Default the namenode host to HDFS_HOSTNAME (not localhost): the
+# NameNode binds to the container hostname's IP by default, not
+# 127.0.0.1, so `localhost` would be refused even when both are in
+# the same container. Setting dfs.namenode.rpc-address=0.0.0.0 in
+# hdfs-site.xml also helps, but using the hostname is more robust
+# for multi-node setups.
+: "${HDFS_NAMENODE_HOST:=${HDFS_HOSTNAME}}"
+# `:-` (not `:=`) — don't mutate the env if already set, just
+# provide a default for the helper to read.
+: "${KRB5_REALM:-TEST.LOCAL}"
+
+# Shared helpers (hdfs_auth_mode, hdfs_wait_for_kdc, hdfs_kinit,
+# hdfs_setup_kerberos_auth, hdfs_wait_for_namenode).
+. /etc/s6-overlay/scripts/hdfs-common.sh
+
+# Kerberos bootstrap — same flow as the namenode, factored into
+# the helper. Surfaces KDC / kinit errors loudly.
+hdfs_setup_kerberos_auth datanode
+
+# Wait for the NameNode to publish its RPC service. The helper
+# probes dfsadmin -report directly rather than just port-checking
+# because the port opens before the RPC handler is ready.
+hdfs_wait_for_namenode
+
+echo "[datanode] Starting..."
+exec gosu hdfs /opt/hadoop/bin/hdfs datanode

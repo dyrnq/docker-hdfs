@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<configuration>
+    <property><name>fs.defaultFS</name><value>hdfs://__HDFS_HOSTNAME__:__HDFS_NAMENODE_RPC_PORT__</value></property>
+    <property><name>hadoop.security.authentication</name><value>__HADOOP_SECURITY_AUTHENTICATION__</value></property>
+    <property><name>hadoop.security.authorization</name><value>true</value></property>
+    <property><name>hadoop.rpc.protection</name><value>authentication</value></property>
+</configuration>

@@ -1,0 +1,105 @@
+#!/usr/bin/with-contenv bash
+set -e
+
+# JAVA_HOME is resolved per-arch in the Dockerfile (stable symlink at
+# /usr/lib/jvm/current-java → java-21-openjdk-<arch>); this fallback
+# only runs if the env is somehow stripped.
+export JAVA_HOME="${JAVA_HOME:?JAVA_HOME must be set by the Dockerfile}"
+export HADOOP_HOME="${HADOOP_HOME:-/opt/hadoop}"
+export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.conf=/etc/krb5.conf"
+
+# HDFS_HOSTNAME is the hostname baked into the kerberos principal;
+# use it as the kinit principal name.
+: "${HDFS_HOSTNAME:=localhost}"
+: "${HADOOP_USER_NAME:=hdfs}"
+
+# Auto-format policy. Two env vars control whether namenode
+# formats on disk and when:
+#
+#   HDFS_NAMENODE_FORCE_FORMAT (default: false)
+#       true  → format unconditionally, even if `current/` already
+#               exists or the format marker says "previously
+#               formatted". Destructive: wipes existing fsimage
+#               + edits log. Use for deliberate cluster resets.
+#       false → only consider the AUTO_FORMAT branch.
+#
+#   HDFS_NAMENODE_AUTO_FORMAT  (default: true)
+#       true  → format on first boot (`current/` missing AND no
+#               format marker). This is the default and matches
+#               single-container dev/test behavior — the volume
+#               is ephemeral so there's no risk of accidentally
+#               wiping persisted state.
+#       false → never auto-format. If `current/` is also missing
+#               when this is set, the namenode will fail to start
+#               and s6 will mark the service down. Use this when
+#               you mount a pre-formatted volume that must not be
+#               touched, or in CI pipelines that provision the
+#               fsimage out-of-band.
+#
+# Format marker (.dyrnq-hdfs-formatted in the namenode storage
+# dir): touched after every successful format. On subsequent
+# boots, the presence of the marker is a signal that the volume
+# was previously formatted by this image. If the marker is
+# present but `current/` is missing, the volume is either
+# corrupted, partially wiped, unmounted, or mounted at the wrong
+# path — and the script REFUSES to format silently. This prevents
+# the classic "first-boot check sees no current/, formats the
+# disk, destroys user data" footgun. To deliberately start over
+# from a corrupted volume, set HDFS_NAMENODE_FORCE_FORMAT=true
+# (which removes the marker as part of the force-format path).
+: "${HDFS_NAMENODE_FORCE_FORMAT:=false}"
+: "${HDFS_NAMENODE_AUTO_FORMAT:=true}"
+
+# Defaults shared with the helper (KRB5_REALM). `:-` (not `:=`)
+# so we don't silently mutate the env if it's already set.
+: "${KRB5_REALM:-TEST.LOCAL}"
+
+# Shared helpers (hdfs_auth_mode, hdfs_wait_for_kdc, hdfs_kinit,
+# hdfs_setup_kerberos_auth, hdfs_wait_for_namenode).
+. /etc/s6-overlay/scripts/hdfs-common.sh
+
+# Kerberos auth: wait for the KDC and kinit. Skipped in Simple
+# auth mode (detected from core-site.xml — see hdfs_auth_mode
+# for why XML is the source of truth rather than the env var).
+# Errors are surfaced loudly via the helper's FATAL log lines so
+# the operator sees the real cause ("kinit failed", "KDC not
+# reachable", etc.) in `docker logs` instead of a 10s-later
+# "Connection reset" inside the RPC handler.
+hdfs_setup_kerberos_auth namenode
+
+NAMENODE_DIR=/var/lib/hadoop/namenode
+FORMAT_MARKER="${NAMENODE_DIR}/.dyrnq-hdfs-formatted"
+
+if [ "${HDFS_NAMENODE_FORCE_FORMAT}" = "true" ]; then
+    if [ -e "${FORMAT_MARKER}" ]; then
+        echo "[namenode] HDFS_NAMENODE_FORCE_FORMAT=true: removing existing format marker for clean slate"
+        rm -f "${FORMAT_MARKER}"
+    fi
+    echo "[namenode] HDFS_NAMENODE_FORCE_FORMAT=true: forcing format..."
+    gosu hdfs /opt/hadoop/bin/hdfs namenode -format -force -nonInteractive
+    touch "${FORMAT_MARKER}"
+elif [ ! -d "${NAMENODE_DIR}/current" ]; then
+    if [ -e "${FORMAT_MARKER}" ]; then
+        # Marker present, current/ missing. The volume was
+        # previously formatted by this image, so the missing
+        # current/ is NOT a fresh-volume signal — refuse to
+        # format and surface the error to s6. This is the
+        # corruption / wrong-mount / partial-wipe case.
+        echo "[namenode] FATAL: format marker ${FORMAT_MARKER} exists but ${NAMENODE_DIR}/current is missing." >&2
+        echo "[namenode] The volume was previously formatted by this image but the NameNode metadata directory is gone." >&2
+        echo "[namenode] This usually means the volume is corrupted, partially wiped, not mounted, or mounted at the wrong path." >&2
+        echo "[namenode] Refusing to auto-format to avoid silent data loss." >&2
+        echo "[namenode] To force a fresh start, set HDFS_NAMENODE_FORCE_FORMAT=true." >&2
+        exit 1
+    fi
+    if [ "${HDFS_NAMENODE_AUTO_FORMAT}" = "true" ]; then
+        echo "[namenode] First boot: formatting NameNode..."
+        gosu hdfs /opt/hadoop/bin/hdfs namenode -format -force -nonInteractive
+        touch "${FORMAT_MARKER}"
+    else
+        echo "[namenode] HDFS_NAMENODE_AUTO_FORMAT=false and no existing data; namenode will fail to start until the volume is formatted out-of-band"
+    fi
+fi
+
+echo "[namenode] Starting..."
+exec gosu hdfs /opt/hadoop/bin/hdfs namenode

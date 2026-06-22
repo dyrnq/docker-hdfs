@@ -1,0 +1,12 @@
+#!/usr/bin/with-contenv bash
+set -e
+# Wait for krb5kdc to open the database socket before kadmind tries
+# to use it. The s6 dependency edge covers ordering, but kadmind can
+# still race the database open in some cases.
+for i in $(seq 1 30); do
+    if nc -z localhost 88 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+exec /usr/sbin/kadmind -nofork
