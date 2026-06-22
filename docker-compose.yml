@@ -1,0 +1,70 @@
+volumes:
+  hdfs-data-debian:
+  hdfs-data-ubuntu:
+  hdfs-kdc-debian:
+  hdfs-kdc-ubuntu:
+
+services:
+  hdfs-debian:
+    build:
+      context: .
+      dockerfile: Dockerfile.debian
+      args:
+        DEBIAN_VERSION: ${DEBIAN_VERSION:-trixie}
+        HADOOP_VERSION: ${HADOOP_VERSION:-3.5.0}
+        HDFS_HOSTNAME: ${HDFS_HOSTNAME:-hdfs.test}
+    image: dyrnq/hdfs:latest-debian
+    restart: unless-stopped
+    hostname: ${HDFS_HOSTNAME:-hdfs.test}
+    ports:
+      - "8020:8020"   # NameNode RPC
+      - "9870:9870"   # NameNode Web UI (HTTP redirect to HTTPS)
+      - "9871:9871"   # NameNode HTTPS
+      - "9864:9864"   # DataNode HTTP
+      - "9865:9865"   # DataNode HTTPS
+      - "9866:9866"   # DataNode IPC
+      - "88:88"       # KDC
+      - "464:464"     # kpasswd
+      - "749:749"     # kadmind
+    environment:
+      HDFS_HOSTNAME: ${HDFS_HOSTNAME:-hdfs.test}
+      KRB5_REALM: ${KRB5_REALM:-TEST.LOCAL}
+      KRB5_KDC: ${KRB5_KDC:-hdfs.test}
+      KRB5_DOMAIN: ${KRB5_DOMAIN:-test}
+      HDFS_NAMENODE_RPC_PORT: 8020
+      HDFS_NAMENODE_HTTPS_PORT: 9871
+    volumes:
+      - hdfs-data-debian:/var/lib/hadoop
+      - hdfs-kdc-debian:/var/lib/krb5kdc
+
+  hdfs-ubuntu:
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu
+      args:
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-26.04}
+        HADOOP_VERSION: ${HADOOP_VERSION:-3.5.0}
+        HDFS_HOSTNAME: ${HDFS_HOSTNAME:-hdfs.test}
+    image: dyrnq/hdfs:latest-ubuntu
+    restart: unless-stopped
+    hostname: ${HDFS_HOSTNAME:-hdfs.test}
+    ports:
+      - "8020:8020"
+      - "9870:9870"
+      - "9871:9871"
+      - "9864:9864"
+      - "9865:9865"
+      - "9866:9866"
+      - "88:88"
+      - "464:464"
+      - "749:749"
+    environment:
+      HDFS_HOSTNAME: ${HDFS_HOSTNAME:-hdfs.test}
+      KRB5_REALM: ${KRB5_REALM:-TEST.LOCAL}
+      KRB5_KDC: ${KRB5_KDC:-hdfs.test}
+      KRB5_DOMAIN: ${KRB5_DOMAIN:-test}
+      HDFS_NAMENODE_RPC_PORT: 8020
+      HDFS_NAMENODE_HTTPS_PORT: 9871
+    volumes:
+      - hdfs-data-ubuntu:/var/lib/hadoop
+      - hdfs-kdc-ubuntu:/var/lib/krb5kdc

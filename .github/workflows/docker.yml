@@ -1,0 +1,123 @@
+name: build and push
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Smoke tests: 2 distros × 2 native arches, run in parallel.
+  #
+  # Each matrix entry uses a runner whose CPU matches the target arch
+  # (ubuntu-24.04 for amd64, ubuntu-24.04-arm for arm64). `docker build`
+  # therefore produces a native image with no QEMU emulation, and
+  # `docker run` from scripts/smoke-test.sh works on the same arch.
+  # Native arm64 smoke is strictly stronger than the previous QEMU
+  # multi-arch build: it actually runs the binary, not just compiles
+  # it. Native arm64 runners have been free for public repos on
+  # GitHub since 2025.
+  #
+  # `fail-fast: false` lets the remaining matrix entries finish after
+  # one fails, so a single distro/arch pair regression doesn't hide
+  # the others from the log.
+  # ---------------------------------------------------------------------
+  smoke:
+    name: smoke (${{ matrix.arch }}, ${{ matrix.variant }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        variant: [debian, ubuntu]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Native single-arch build. The runner's CPU matches the
+      # target arch, so `docker build` produces a native image
+      # without QEMU. scripts/smoke-test.sh does `docker run`
+      # directly on this tag — cross-arch run would need an
+      # emulator the smoke test does not set up.
+      - name: Build ${{ matrix.variant }} test image (native ${{ matrix.arch }})
+        run: docker build -f Dockerfile.${{ matrix.variant }} -t dyrnq/hdfs:${{ matrix.variant }}-test .
+
+      # Two auth modes per (arch, variant):
+      #   kerberos — the image's normal entrypoint runs KDC + keytab
+      #              + service principals, then NameNode + DataNode
+      #              kinit and authenticate over SASL.
+      #   simple   — same entrypoint, but with
+      #              `-e HADOOP_SECURITY_AUTHENTICATION=simple`. The
+      #              entrypoint strips the krb5kdc + kadmind s6
+      #              services and skips KDC bootstrap + keytab +
+      #              keystore. Simple-auth core/hdfs-site.xml are
+      #              still bind-mounted read-only so the rendered
+      #              XMLs carry Simple + HTTP_ONLY; the entrypoint's
+      #              XML write-back is guarded by `[ -w ]` and
+      #              skips silently when the bind is read-only.
+      - name: Smoke test ${{ matrix.variant }} (kerberos, ${{ matrix.arch }})
+        run: bash scripts/smoke-test.sh kerberos dyrnq/hdfs:${{ matrix.variant }}-test
+
+      - name: Smoke test ${{ matrix.variant }} (simple, ${{ matrix.arch }})
+        run: bash scripts/smoke-test.sh simple dyrnq/hdfs:${{ matrix.variant }}-test
+
+  # ---------------------------------------------------------------------
+  # Multi-arch push: gated on the per-arch smoke matrix passing.
+  #
+  # Step ordering matters:
+  #   1. Multi-arch `--push false` first — this catches the class
+  #      of bugs the per-arch smoke does NOT cover:
+  #        * `uname -m` branching in the Dockerfile (s6-overlay
+  #          arch selection) under QEMU+binfmt emulation
+  #        * cross-platform RUN-cache / per-platform ARG scoping
+  #      If this fails we abort before login, so a broken
+  #      manifest never reaches DockerHub and we never burn the
+  #      rate limit on a doomed push.
+  #   2. Login to DockerHub — only on a clean validation.
+  #   3. Multi-arch `--push true` — same images, real push.
+  # ---------------------------------------------------------------------
+  push:
+    name: multi-arch push
+    needs: smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Multi-arch build (no push) — Debian
+        run: |
+          ./buildx.sh --push false \
+            --dockerfile Dockerfile.debian \
+            --tag hdfs:latest \
+            --tag hdfs:latest-debian
+
+      - name: Multi-arch build (no push) — Ubuntu
+        run: |
+          ./buildx.sh --push false \
+            --dockerfile Dockerfile.ubuntu \
+            --tag hdfs:latest-ubuntu
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Multi-arch build & push — Debian
+        run: |
+          ./buildx.sh --push true \
+            --dockerfile Dockerfile.debian \
+            --tag hdfs:latest \
+            --tag hdfs:latest-debian
+
+      - name: Multi-arch build & push — Ubuntu
+        run: |
+          ./buildx.sh --push true \
+            --dockerfile Dockerfile.ubuntu \
+            --tag hdfs:latest-ubuntu

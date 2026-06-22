@@ -1,0 +1,156 @@
+ARG DEBIAN_VERSION=trixie
+ARG S6_OVERLAY_VERSION=3.2.0.2
+ARG HADOOP_VERSION=3.5.0
+# Hostname baked into the kerberos principals and self-signed TLS
+# cert. The host that runs this container MUST pass --hostname
+# matching this value, otherwise the NameNode binds to a different
+# address than the one in the service principal and SASL auth fails
+# with "Connection reset by peer".
+ARG HDFS_HOSTNAME=hdfs.test
+
+FROM debian:${DEBIAN_VERSION}-slim
+
+# Re-declare every ARG that the ENV / RUN below depends on. Top-level
+# ARG defaults (set above) are not visible inside a build stage until
+# the ARG is re-declared here — Docker ignores the default for any
+# reference before re-declaration, so the order matters.
+ARG S6_OVERLAY_VERSION
+ARG HADOOP_VERSION
+ARG HDFS_HOSTNAME
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    JAVA_HOME=/usr/lib/jvm/current-java \
+    HADOOP_HOME=/opt/hadoop \
+    PATH=/opt/hadoop/bin:/opt/hadoop/sbin:${PATH} \
+    S6_OVERLAY_VERSION=${S6_OVERLAY_VERSION} \
+    HADOOP_VERSION=${HADOOP_VERSION} \
+    HDFS_HOSTNAME=${HDFS_HOSTNAME}
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        openjdk-21-jdk-headless \
+        krb5-kdc krb5-admin-server krb5-user \
+        curl wget ca-certificates procps netcat-openbsd gosu \
+        bash xz-utils libxml2-utils; \
+    rm -rf /var/lib/apt/lists/*; \
+    # openjdk installs to /usr/lib/jvm/java-21-openjdk-<arch> (amd64 on
+    # x86_64, arm64 on aarch64). ENV is static, so point JAVA_HOME at a
+    # stable symlink resolved per-arch here — otherwise the arm64
+    # multi-arch build gets an amd64 path and Hadoop can't find java.
+    JAVA_HOME_REAL="$(dirname "$(dirname "$(readlink -f /usr/bin/java)")")"; \
+    ln -sfn "${JAVA_HOME_REAL}" /usr/lib/jvm/current-java; \
+    echo "JAVA_HOME -> ${JAVA_HOME_REAL}"
+
+RUN set -eux; \
+    ARCH="$(uname -m)"; \
+    case "${ARCH}" in \
+        aarch64|arm64) s6arch="aarch64" ;; \
+        amd64|x86_64)  s6arch="x86_64" ;; \
+        *) echo "Unsupported arch: ${ARCH}"; exit 1 ;; \
+    esac; \
+    # Verify s6-overlay tarballs against the per-asset .sha256 the
+    # release ships next to each .tar.xz. There is no aggregate
+    # SHA256SUMS file in s6-overlay releases (verified: 404 on
+    # sha256sums.txt / SHA256SUMS / sha256sum.txt as of v3.2.0.2),
+    # so we pull each .sha256 individually — each is a single-line
+    # `<hash>  <filename>` in standard sha256sum format. The
+    # .sha256 comes from the same GitHub release (HTTPS-attested by
+    # GitHub) and pins each tarball to a specific digest, so a
+    # mirror compromise or in-flight tampering that swaps a
+    # tarball also has to forge its matching .sha256 — strictly
+    # stronger than trusting the tarball itself. (GPG verification
+    # of a maintainer-signed SHA256SUMS.asc would be stronger still;
+    # skipped here to avoid pinning a maintainer key in-tree.)
+    S6_BASE="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
+    cd /tmp; \
+    for s6asset in "s6-overlay-${s6arch}" s6-overlay-noarch s6-overlay-symlinks-noarch; do \
+        curl --retry 3 -f#SL "${S6_BASE}/${s6asset}.tar.xz" -o "${s6asset}.tar.xz"; \
+        curl --retry 3 -f#SL "${S6_BASE}/${s6asset}.tar.xz.sha256" -o "${s6asset}.tar.xz.sha256"; \
+        sha256sum -c --strict "${s6asset}.tar.xz.sha256"; \
+    done; \
+    for s6asset in "s6-overlay-${s6arch}" s6-overlay-noarch s6-overlay-symlinks-noarch; do \
+        tar -Jxf "${s6asset}.tar.xz" -C /; \
+    done; \
+    rm -f s6-overlay-*.tar.xz s6-overlay-*.tar.xz.sha256
+
+ARG HADOOP_VERSION
+# Apache publishes a per-artifact .sha512 next to every release file
+# on dlcdn.apache.org, in OpenSSL format
+# `SHA512 (hadoop-X.Y.Z.tar.gz) = <hash>`. GNU coreutils sha512sum
+# understands this format and looks for the named file in the
+# current working directory, so we keep the upstream filename on
+# disk (do not rename to hadoop.tar.gz — that breaks the lookup).
+# A mirror compromise alone cannot serve a tarball whose hash does
+# not match the digest Apache itself published alongside it. (GPG
+# verification of the matching .asc file via Apache's release-
+# manager KEYS ring would be stronger still; skipped here to avoid
+# the key-pinning commitment in-tree.)
+RUN set -eux; \
+    mkdir -p /opt/hadoop; \
+    cd /tmp; \
+    HADOOP_TARBALL="hadoop-${HADOOP_VERSION}.tar.gz"; \
+    HADOOP_URL="https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/${HADOOP_TARBALL}"; \
+    curl --retry 3 -f#SL "${HADOOP_URL}" -o "${HADOOP_TARBALL}"; \
+    curl --retry 3 -f#SL "${HADOOP_URL}.sha512" -o "${HADOOP_TARBALL}.sha512"; \
+    sha512sum -c "${HADOOP_TARBALL}.sha512"; \
+    # --strip-components=1 drops the upstream "hadoop-X.Y.Z/" prefix
+    # so the tarball extracts straight into /opt/hadoop instead of
+    # /opt/hadoop-X.Y.Z + symlink. No intermediate versioned dir →
+    # no symlink-traversal pitfalls for chown, simpler image, and
+    # ${HADOOP_HOME} in the entrypoint resolves to a real directory.
+    tar xzf "${HADOOP_TARBALL}" --strip-components=1 -C /opt/hadoop; \
+    rm -f "${HADOOP_TARBALL}" "${HADOOP_TARBALL}.sha512"
+
+# App user — uid 1000 matches typical host user.
+RUN set -eux; \
+    if id hdfs 2>/dev/null; then \
+        echo "hdfs user already exists"; \
+    else \
+        groupadd -g 1000 -o hdfs && \
+        useradd -u 1000 -g 1000 -m -s /bin/bash hdfs; \
+    fi
+
+# krb5.conf + the Hadoop XML configs ship via the rootfs tree at
+# the bottom of this Dockerfile (`COPY rootfs /`) — see rootfs/
+# etc/krb5.conf and rootfs/opt/hadoop/etc/hadoop/{core,hdfs}-
+# site.xml. Single COPY for the whole app config; mirrors the
+# pattern in dyrnq/krb5-server.
+
+# Writable dirs for the hdfs user. Must exist at image build
+# time because some simple-auth deployments sidestep the entrypoint
+# (`docker run --entrypoint /init` directly) — without this RUN,
+# /opt/hadoop/logs would not exist in that mode and the namenode
+# would crash with "Unable to create /opt/hadoop/logs. Aborting."
+# The entrypoint's own mkdir + chown (below) covers the normal
+# path through docker-entrypoint.sh; this RUN is the fallback for
+# entrypoint-bypass runners. Kept narrow: only the dirs hdfs
+# actually writes to, NOT the full /opt/hadoop tree (which holds
+# 600MB+ of read-only Hadoop binaries — recursive chown over that
+# is ~10s of cold-start wall clock).
+RUN set -eux; \
+    mkdir -p /var/lib/hadoop/namenode /var/lib/hadoop/datanode /opt/hadoop/logs; \
+    chown hdfs:hdfs \
+        /var/lib/hadoop \
+        /var/lib/hadoop/namenode \
+        /var/lib/hadoop/datanode \
+        /opt/hadoop/logs
+
+COPY rootfs /
+
+# Make all s6 service scripts + the entrypoint executable. The
+# Write tool used to author these files leaves them at 0644 by
+# default, so we fix the mode here rather than rely on the
+# host-side umask.
+RUN find /etc/s6-overlay/s6-rc.d -type f \( -name run -o -name finish \) \
+        -exec chmod 0755 {} +; \
+    chmod 0755 /docker-entrypoint.sh
+
+# Pin CACHE_BUSTER at the bottom so edits to the source tree
+# invalidate the build cache even when all other layers match.
+ARG CACHE_BUSTER=1
+
+EXPOSE 8020 9870 9871 9866 9864 9865 88 464 749
+
+ENTRYPOINT ["/docker-entrypoint.sh"]

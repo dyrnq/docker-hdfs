@@ -1,0 +1,9 @@
+.git/
+*.bak
+*.tmp
+.DS_Store
+
+# Local-build-only mirror variants (use CN mirrors + GitHub proxy).
+# Not published; derived from Dockerfile.<base> on demand.
+Dockerfile.*.mirror
+SECURITY.md
