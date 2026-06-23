@@ -27,7 +27,6 @@ set -euo pipefail
 # actually exposes the testuser principal.
 : "${KRB5_TESTUSER_PASS:=testpass}"
 : "${HDFS_NAMENODE_RPC_PORT:=8020}"
-: "${HDFS_NAMENODE_HTTPS_PORT:=9871}"
 : "${KEYSTORE_PASS:=changeit}"
 # Auth mode: "kerberos" (default, image runs the embedded KDC) or
 # "simple" (HADOOP_SECURITY_AUTHENTICATION=Simple). In simple mode we
@@ -123,7 +122,6 @@ for f in hdfs-site.xml core-site.xml; do
         -e "s|__HDFS_HOSTNAME__|${HDFS_HOSTNAME}|g" \
         -e "s|__KRB5_REALM__|${KRB5_REALM}|g" \
         -e "s|__HDFS_NAMENODE_RPC_PORT__|${HDFS_NAMENODE_RPC_PORT}|g" \
-        -e "s|__HDFS_NAMENODE_HTTPS_PORT__|${HDFS_NAMENODE_HTTPS_PORT}|g" \
         -e "s|__HADOOP_SECURITY_AUTHENTICATION__|${HADOOP_SECURITY_AUTHENTICATION}|g" \
         "${HADOOP_ETC}/${f}" > "${TMPDIR_ENT}/${f}"
 done
@@ -144,6 +142,29 @@ for f in hdfs-site.xml core-site.xml; do
         continue
     fi
     cp -f "${TMPDIR_ENT}/${f}" "${HADOOP_ETC}/${f}"
+done
+
+# Env→XML injection (inspired by apache/ozone envtoconf). After the
+# placeholder substitution above, any env var named
+# `<NAME>.XML_<hadoop-key>=<value>` is merged into `<name>.xml`:
+# same key overwrites the existing <value> in place; a new key is
+# appended before </configuration>. This lets an operator tweak one
+# property (e.g. switch dfs.namenode.rpc-address to a pod IP in k8s)
+# with `-e HDFS-SITE.XML_dfs.namenode.rpc-address=...` instead of
+# bind-mounting a whole XML. Values are XML-escaped, config keys pass a
+# whitelist, and the output is well-formed by construction. The merger is
+# a static Rust binary (`/usr/local/bin/envtoxml`, built in a multi-stage
+# Dockerfile from tools/envtoxml/) — no python3 runtime, no bash quoting
+# hazards. See tools/envtoxml/src/main.rs for the full contract. Skipped
+# for read-only (mount-overridden) XMLs, consistent with the cp-back guard
+# above: an operator who mounts their own XML is fully in charge and is
+# not second-guessed by env vars.
+for f in hdfs-site.xml core-site.xml; do
+    [ -w "${HADOOP_ETC}/${f}" ] || continue
+    if ! envtoxml "${HADOOP_ETC}/${f}"; then
+        echo "FATAL: envtoxml failed on ${HADOOP_ETC}/${f}" >&2
+        exit 1
+    fi
 done
 
 # Clean up now: the script ends with `exec /init`, and exec does not
