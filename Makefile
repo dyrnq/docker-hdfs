@@ -80,3 +80,12 @@ smoke-ubuntu:
 
 .PHONY: smoke-all
 smoke-all: smoke-kerberos smoke-simple
+
+# Run `cargo fmt --check` + `cargo test` against the envtoxml Rust
+# crate. Same checks CI runs (see .github/workflows/docker.yml `lint`
+# job); convenient locally so a contributor can confirm their tree is
+# green before pushing. Doesn't touch any docker artifacts — fast
+# (~5s cold).
+.PHONY: test-envtoxml
+test-envtoxml:
+	cd tools/envtoxml && cargo fmt --check && cargo test
