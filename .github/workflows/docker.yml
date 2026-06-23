@@ -44,10 +44,11 @@ jobs:
         with:
           workspaces: tools/envtoxml -> target
 
-      - name: Install Rust 1.83 + both musl targets
+      - name: Install Rust 1.83 + rustfmt + both musl targets
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.83
+          components: rustfmt
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       # amd64 musl build: native `cargo build` on the host, only needs
