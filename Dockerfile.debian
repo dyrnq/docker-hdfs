@@ -8,6 +8,34 @@ ARG HADOOP_VERSION=3.5.0
 # with "Connection reset by peer".
 ARG HDFS_HOSTNAME=hdfs.test
 
+# ---------------------------------------------------------------------------
+# Builder stage: compile the env→XML merger (`envtoxml`) to a static musl
+# binary. This is a tiny Rust tool (tools/envtoxml/) that merges
+# `<NAME>.XML_<key>=<value>` env vars into Hadoop XML configs at container
+# start — see its src/main.rs header. We build it statically so the runtime
+# stage needs NO Rust/libc dependency; only the ~440KB binary is copied.
+#
+# Multi-arch: buildx builds each platform natively (the rest of this file
+# already selects per-arch assets via `uname -m`), so this builder runs on
+# the target arch and compiles natively — no cross-compile matrix. musl-
+# tools provides the musl linker for the static target of the current arch.
+# ---------------------------------------------------------------------------
+FROM rust:1.83-slim-bookworm AS envtoxml-builder
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY tools/envtoxml .
+RUN set -eux; \
+    ARCH="$(uname -m)"; \
+    case "${ARCH}" in \
+        aarch64|arm64) target="aarch64-unknown-linux-musl" ;; \
+        amd64|x86_64)  target="x86_64-unknown-linux-musl" ;; \
+        *) echo "Unsupported arch: ${ARCH}"; exit 1 ;; \
+    esac; \
+    rustup target add "${target}"; \
+    cargo build --release --target "${target}"; \
+    cp "target/${target}/release/envtoxml" /envtoxml
+
 FROM debian:${DEBIAN_VERSION}-slim
 
 # Re-declare every ARG that the ENV / RUN below depends on. Top-level
@@ -138,6 +166,11 @@ RUN set -eux; \
         /opt/hadoop/logs
 
 COPY rootfs /
+
+# Pull the statically-built env→XML merger from the builder stage into
+# /usr/local/bin (on PATH). The entrypoint calls it bare (`envtoxml …`),
+# and it merges <NAME>.XML_<key>=<value> env vars into the Hadoop XMLs.
+COPY --from=envtoxml-builder /envtoxml /usr/local/bin/envtoxml
 
 # Make all s6 service scripts + the entrypoint executable. The
 # Write tool used to author these files leaves them at 0644 by
