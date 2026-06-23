@@ -85,7 +85,7 @@ make build-ubuntu up-ubuntu
 | `HDFS_NAMENODE_RPC_PORT`     | no       | `8020`       | NameNode RPC port. Drives `dfs.namenode.rpc-address` + `fs.defaultFS` (shared) and the `dfsadmin -report` wait poll. |
 | `HDFS_NAMENODE_AUTO_FORMAT`  | no       | `true`       | If `true` (default), the NameNode formats on first boot when `/var/lib/hadoop/namenode/current` is missing. Set to `false` to disable silent auto-format (e.g. when mounting a pre-formatted volume that must not be touched). |
 | `HDFS_NAMENODE_FORCE_FORMAT` | no       | `false`      | If `true`, the NameNode formats unconditionally on every boot, wiping any existing fsimage. Destructive. Takes priority over `AUTO_FORMAT`. |
-| `HADOOP_SECURITY_AUTHENTICATION` | no   | `kerberos`  | `kerberos` (default, embedded KDC) or `simple`. In `simple` mode the entrypoint (a) strips the `krb5kdc` + `kadmind` s6 services and (b) skips KDC bootstrap, keytab generation, and the self-signed keystore. The sed substitution below also rewrites `hadoop.security.authentication` in `core-site.xml` from the `__HADOOP_SECURITY_AUTHENTICATION__` placeholder to `simple`, which is enough to flip the s6 run scripts (`hdfs-common.sh: hdfs_auth_mode` reads the XML as the source of truth — defensive against a typo'd or hand-edited XML). The sed substitution does NOT touch the rest of the XML: `core-site.xml` keeps `hadoop.security.authorization=true` and `hadoop.rpc.protection=authentication`, and `hdfs-site.xml` keeps the kerberos principal/keytab/block-token properties. Those are harmless without a KDC (the principals never resolve, `dfs.http.policy` defaults to HTTP_ONLY so the missing keystore is fine), but operators who want a clean Simple-auth cluster should bind-mount `core-site.xml` + `hdfs-site.xml` containing `Simple` + `HTTP_ONLY` + no kerberos properties — see `scripts/conf/simple/` for a working pair. |
+| `HADOOP_SECURITY_AUTHENTICATION` | no   | `kerberos`  | `kerberos` (default, embedded KDC) or `simple`. In `simple` mode the entrypoint (a) strips the `krb5kdc` + `kadmind` s6 services and (b) skips KDC bootstrap, keytab generation, and the self-signed keystore. The sed substitution below also rewrites `hadoop.security.authentication` in `core-site.xml` from the `__HADOOP_SECURITY_AUTHENTICATION__` placeholder to `simple`, which is enough to flip the s6 run scripts (`hdfs-common.sh: hdfs_auth_mode` reads the XML as the source of truth — defensive against a typo'd or hand-edited XML). The sed substitution does NOT touch the rest of the XML: `core-site.xml` keeps `hadoop.security.authorization=true` and `hadoop.rpc.protection=authentication`, and `hdfs-site.xml` keeps the kerberos principal/keytab/block-token properties. Those are harmless without a KDC (the principals never resolve, `dfs.http.policy` defaults to HTTP_ONLY so the missing keystore is fine). To produce a clean Simple-auth cluster — no leftover `*kerberos.principal` / `*.keytab.file` / `dfs.data.transfer.protection` / `hadoop.rpc.protection`, and `dfs.block.access.token.enable=false` + `hadoop.security.authorization=false` — set `HADOOP_SECURITY_AUTHENTICATION=simple` AND the env recipe in the next section. |
 | `HDFS_KDC_WAIT_TIMEOUT`      | no       | `30`         | Number of attempts (≈2× wall seconds) the namenode + datanode run scripts poll the KDC port 88 for, before giving up with a FATAL log line. |
 | `HDFS_NAMENODE_WAIT_TIMEOUT` | no       | `60`         | Number of attempts (≈2× wall seconds) the datanode run script polls `dfsadmin -report` for, before giving up with a FATAL log line. |
 | `KEYSTORE_PASS`              | no       | `changeit`   | HTTPS self-signed keystore password. Ignored in simple mode (no keystore generated). |
@@ -123,6 +123,40 @@ docker run -e HDFS-SITE.XML_dfs.client.use.datanode.hostname=true \
 
 The most common use is overriding `dfs.namenode.rpc-address` in k8s (see
 the Notes below).
+
+### Simple auth recipe (drop the kerberos template's KDC-specific properties)
+
+`HADOOP_SECURITY_AUTHENTICATION=simple` flips the run scripts off
+Kerberos, but the in-image `hdfs-site.xml` / `core-site.xml` are
+written for kerberos-first and still carry keytab paths, SPNs, and
+`hadoop.rpc.protection=authentication`. The cleanest deployment is
+to `!remove` the kerberos-only properties and overwrite the two
+auth-mode flags via envtoxml, in the same `docker run`:
+
+```bash
+docker run -d --name hdfs \
+  -e HADOOP_SECURITY_AUTHENTICATION=simple \
+  -e HDFS_HOSTNAME=hdfs.test \
+  -e "HDFS-SITE.XML_dfs.namenode.kerberos.principal=!remove" \
+  -e "HDFS-SITE.XML_dfs.namenode.keytab.file=!remove" \
+  -e "HDFS-SITE.XML_dfs.datanode.kerberos.principal=!remove" \
+  -e "HDFS-SITE.XML_dfs.datanode.keytab.file=!remove" \
+  -e "HDFS-SITE.XML_dfs.web.authentication.kerberos.principal=!remove" \
+  -e "HDFS-SITE.XML_dfs.web.authentication.kerberos.keytab=!remove" \
+  -e "HDFS-SITE.XML_dfs.data.transfer.protection=!remove" \
+  -e "HDFS-SITE.XML_dfs.block.access.token.enable=false" \
+  -e "CORE-SITE.XML_hadoop.rpc.protection=!remove" \
+  -e "CORE-SITE.XML_hadoop.security.authorization=false" \
+  dyrnq/hdfs:latest
+```
+
+This is exactly what `scripts/smoke-test.sh` does in simple mode
+(the smoke test doubles as the documented recipe). For k8s, paste
+the env list into a `Deployment`'s `env:` array or a ConfigMap.
+
+Note: `dfs.datanode.hostname` is left in place — it's cosmetic
+(`DatanodeID.hostName` only) and matches `HDFS_HOSTNAME` after the
+entrypoint's sed pass, so leaving it is harmless.
 
 
 ## Build args
@@ -364,4 +398,25 @@ In `simple` mode, the script:
   neither — both were investigated and ruled out in issue #8.) Override
   at runtime without a rebuild with
   `-e HDFS-SITE.XML_dfs.namenode.rpc-address=<pod-ip>:<port>`.
+- **DataNode IPv6-only bind regression** (GitHub issue #11): on
+  IPv6-first JVMs (Debian 13 + OpenJDK 21), `InetSocketAddress("0.0.0.0", …)`
+  resolves IPv6 first, so a DataNode configured with the old
+  `dfs.datanode.address=0.0.0.0:9866` ended up listening on `[::]:9866`
+  only — every IPv4 client (opendal, hdfs-native, anything that
+  resolves the DN hostname via A-only) got `ECONNREFUSED` on the
+  registered IPv4 `ip_addr`. The image now ships
+  `dfs.datanode.address=__HDFS_HOSTNAME__:port` (and the matching
+  `http-address` / `https-address`) plus `dfs.datanode.bind-host=0.0.0.0`,
+  which makes the DN bind a **non-IPv6-wildcard** address — in
+  practice an IPv4-mapped IPv6 socket on `::ffff:<resolved-ip>:port`
+  in `/proc/net/tcp6` (FFFF0000 prefix). The kernel still routes
+  IPv4 input to that socket on a dual-stack system, so IPv4 clients
+  can connect; the regression-test (smoke) verifies the bind is
+  not the pure `[::]:port` form. `bind-host` covers ALL DN sockets
+  (data 9866, http 9864, https 9865, ipc 9867) as a single switch
+  (Hadoop 3.3.0+, see `DFSConfigKeys.DFS_DATANODE_BIND_HOST_KEY`).
+  **k8s caveat** is the same as issue #8: `HDFS_HOSTNAME` must
+  resolve to the pod IP. Override at runtime with
+  `-e HDFS-SITE.XML_dfs.datanode.address=<pod-ip>:<port> \
+  -e HDFS-SITE.XML_dfs.datanode.bind-host=0.0.0.0`.
 
