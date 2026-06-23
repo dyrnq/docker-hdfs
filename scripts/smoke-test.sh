@@ -12,18 +12,26 @@
 #       dfsadmin -report, kinit, and a put/cat round trip.
 #
 #   simple
-#       The image is kerberos-only by design. To exercise the
+#       The image is kerberos-only by design — there's no Simple
+#       config template baked in. To exercise the
 #       hadoop.security.authentication=Simple code path we run the
 #       same entrypoint but pass HADOOP_SECURITY_AUTHENTICATION=simple
 #       — that tells docker-entrypoint.sh to skip KDC bootstrap +
 #       keytab + keystore generation, strip the krb5kdc + kadmind
 #       s6 services, and let the namenode + datanode longruns come
-#       up unauthenticated. We still bind-mount a Simple-auth
-#       core-site.xml + hdfs-site.xml over /opt/hadoop/etc/hadoop/
-#       so the rendered XMLs actually carry Simple + HTTP_ONLY. The
-#       s6 longruns come up with those configs and the hdfs commands
-#       run as the hdfs user with no kinit. The test still exercises
-#       dfsadmin -report and a put/cat round trip.
+#       up unauthenticated. We then drive the in-image kerberos
+#       template toward Simple-auth shape via envtoxml env vars —
+#       one overwrite (block.access.token.enable=false +
+#       hadoop.security.authorization=false) plus eight `!remove`
+#       sentinels for the kerberos-only properties (keytabs, SPNs,
+#       rpc-protection). This is the same path any user would
+#       take to deploy Simple auth from this image, so smoke
+#       doubles as the documented recipe. The s6 longruns come up
+#       with the env-rendered XMLs and the hdfs commands run as
+#       the hdfs user with no kinit. The test still exercises
+#       dfsadmin -report and a put/cat round trip, plus assertions
+#       that all the !remove / overwrite env vars actually
+#       landed.
 #
 # Usage:
 #   ./scripts/smoke-test.sh                          # kerberos (default)
@@ -101,21 +109,31 @@ else
     # applies (no-op for the Simple flag), and writes the same
     # content back. The mount override survives because the
     # entrypoint's `cp -f` writes to the host-mounted path.
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    SIMPLE_CORE="${SCRIPT_DIR}/conf/simple/core-site.xml"
-    SIMPLE_HDFS="${SCRIPT_DIR}/conf/simple/hdfs-site.xml"
-    if [ ! -f "$SIMPLE_CORE" ] || [ ! -f "$SIMPLE_HDFS" ]; then
-        echo "FAIL: missing ${SIMPLE_CORE} or ${SIMPLE_HDFS}"
-        exit 1
-    fi
-    echo "=== Starting container (simple, mount-overridden configs) ==="
+    # Simple auth launch: no KDC, no keytab, no SPNs. Drive the
+    # in-image kerberos template toward Simple-auth shape via
+    # envtoxml env vars (one source of truth, no scripts/conf/
+    # directory to keep in sync). Each var below corresponds to
+    # a documented difference between the kerberos default and a
+    # Simple-auth setup; together they form the recipe any user
+    # can copy into a deployment. envtoxml's [ -w ] guard runs
+    # because we don't bind-mount the XMLs, so the merges are
+    # actually applied to /opt/hadoop/etc/hadoop/*.xml.
+    echo "=== Starting container (simple, env-driven) ==="
     docker run -d --name "$SERVER" \
         --network "$NET" \
         --hostname "$HOST" \
         -e HDFS_HOSTNAME="$HOST" \
         -e HADOOP_SECURITY_AUTHENTICATION=simple \
-        -v "${SIMPLE_CORE}:/opt/hadoop/etc/hadoop/core-site.xml:ro" \
-        -v "${SIMPLE_HDFS}:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro" \
+        -e "HDFS-SITE.XML_dfs.namenode.kerberos.principal=!remove" \
+        -e "HDFS-SITE.XML_dfs.namenode.keytab.file=!remove" \
+        -e "HDFS-SITE.XML_dfs.datanode.kerberos.principal=!remove" \
+        -e "HDFS-SITE.XML_dfs.datanode.keytab.file=!remove" \
+        -e "HDFS-SITE.XML_dfs.web.authentication.kerberos.principal=!remove" \
+        -e "HDFS-SITE.XML_dfs.web.authentication.kerberos.keytab=!remove" \
+        -e "HDFS-SITE.XML_dfs.data.transfer.protection=!remove" \
+        -e "HDFS-SITE.XML_dfs.block.access.token.enable=false" \
+        -e "CORE-SITE.XML_hadoop.rpc.protection=!remove" \
+        -e "CORE-SITE.XML_hadoop.security.authorization=false" \
         "$IMAGE"
 fi
 
@@ -229,35 +247,110 @@ FIRST_IP=$(echo "$REPORT" | grep -E '^Name: ' | head -1 | awk '{print $2}' || tr
 echo "  DataNode Name: $FIRST_IP"
 
 # ---------------------------------------------------------------------
-# envtoxml feature check (kerberos mode only — simple mode mounts
-# the XMLs :ro, so envtoxml's [ -w ] guard skips them; the append /
-# overwrite / !remove code paths need a writable XML). The three
-# values passed at docker run time must all be reflected in
-# /opt/hadoop/etc/hadoop/hdfs-site.xml after the entrypoint applies
-# envtoxml — confirming each code path end-to-end.
+# Issue #11 regression: the DataNode must have a LISTEN entry that
+# accepts IPv4 traffic, not IPv6-only.
 #
-# We use `grep -c <name>` rather than parsing XML because the goal is
-# "did envtoxml apply the change", not "is the XML schema-valid".
-# Format-agnostic, and the surrounding `<value>...</value>` substring
-# check confirms the value landed in the right element.
+# On Debian 13 + OpenJDK 21, `InetSocketAddress("0.0.0.0", 9866)`
+# resolves IPv6-first (getAllByName("0.0.0.0") returns the IPv6
+# wildcard first when `net.ipv6.bindv6only=0`), so the JVM creates
+# only an IPv6 listener. IPv4-only clients (opendal, hdfs-native,
+# anything that resolves A-only) then get ECONNREFUSED on the
+# registered ip_addr. The fix: dfs.datanode.address=hostname:port
+# + dfs.datanode.bind-host=0.0.0.0 makes the DN bind a non-IPv6-
+# wildcard address (in practice an IPv4-mapped IPv6 socket on
+# ::ffff:<resolved-ip>), which the kernel routes to on IPv4 input.
+#
+# Detection: a LISTEN on the port that is NOT the pure IPv6 wildcard
+# `00000000000000000000000000000000` is acceptable. The original bug
+# shows as that exact address in /proc/net/tcp6. The fix produces
+# either an IPv4 entry in /proc/net/tcp (`00000000:PORT` for the
+# wildcard) or an IPv4-mapped IPv6 entry in /proc/net/tcp6
+# (`0000000000000000FFFF0000<ipv4>:PORT`).
+#
+# We DO NOT use nc -z from inside the container to the container's
+# own IPv4: in dev env (linux bridge, bindv6only=0) the dual-stack
+# IPv6 listener ACCEPTS IPv4-mapped connections, so nc -z would pass
+# even when the regression is present. /proc/net/tcp[6] is the
+# authoritative source.
 # ---------------------------------------------------------------------
-if [ "$MODE" = "kerberos" ]; then
-    echo "=== Verifying envtoxml injection (append + overwrite + !remove) ==="
-    HDFS_XML=/opt/hadoop/etc/hadoop/hdfs-site.xml
-    XML_CONTENT=$(docker exec "$SERVER" cat "${HDFS_XML}" 2>/dev/null || true)
-    if [ -z "$XML_CONTENT" ]; then
-        echo "FAIL: could not read ${HDFS_XML} from container"
-        docker logs "$SERVER"
-        exit 1
+echo "=== Verifying DataNode IPv4 listener (issue #11) ==="
+PROC_TCP=$(docker exec "$SERVER" cat /proc/net/tcp 2>/dev/null || true)
+PROC_TCP6=$(docker exec "$SERVER" cat /proc/net/tcp6 2>/dev/null || true)
+if [ -z "$PROC_TCP" ] || [ -z "$PROC_TCP6" ]; then
+    echo "FAIL: could not read /proc/net/tcp[6] inside container"
+    exit 1
+fi
+FAIL=0
+for port in 9864 9866; do
+    port_hex=$(printf '%04X' "$port")
+    # IPv4 LISTEN (wildcard or specific): local_address ends with :PORT
+    # and st=0A.  Format  "00000000:PORT"  or  "XXXXXXXX:PORT".
+    v4=$(echo "$PROC_TCP" | awk -v p=":$port_hex" \
+        '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
+    # IPv6 LISTEN, EXCLUDING the pure IPv6 wildcard
+    # 00000000000000000000000000000000. An IPv4-mapped IPv6 entry
+    # looks like 0000000000000000FFFF0000<ipv4hex>:PORT.
+    v6=$(echo "$PROC_TCP6" | awk -v p=":$port_hex" \
+        '$2 ~ p"$" && $4 == "0A" && $2 !~ /^00000000000000000000000000000000:/ {print $2; exit}')
+    if [ -n "$v4" ] || [ -n "$v6" ]; then
+        echo "  port $port LISTEN: ${v4:+(ipv4) $v4}${v6:+(ipv6-mapped) $v6}"
+    else
+        # No IPv4 wildcard AND no non-wildcard IPv6 entry → the
+        # listener is IPv6-only (the bug). Surface the IPv6 entry
+        # if any, so the operator sees exactly what was bound.
+        v6_wild=$(echo "$PROC_TCP6" | awk -v p=":$port_hex" \
+            '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
+        echo "FAIL: port $port (0x$port_hex) is IPv6-only — issue #11 regression"
+        echo "      IPv6 wildcard LISTEN: ${v6_wild:-none}"
+        FAIL=1
     fi
+done
+if [ "$FAIL" = "1" ]; then
+    echo "  /proc/net/tcp (IPv4) dump:"
+    echo "$PROC_TCP" | sed 's/^/    /'
+    echo "  /proc/net/tcp6 (IPv6) dump:"
+    echo "$PROC_TCP6" | sed 's/^/    /'
+    docker logs "$SERVER"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# envtoxml feature check. The kerberos and simple modes both pass
+# env vars at `docker run` time, and the entrypoint's envtoxml pass
+# must apply them to /opt/hadoop/etc/hadoop/*.xml. We assert each
+# code path end-to-end here — the goal is "did envtoxml apply the
+# change", not "is the XML schema-valid", so we use `grep` on the
+# rendered file rather than parsing XML.
+#
+#   - kerberos mode: tests 3 paths with 3 dedicated smoke env vars
+#     (append / overwrite / !remove) — the only env vars that
+#     mutate the rendered XML in a way that doesn't break the
+#     kerberos auth path.
+#   - simple mode: tests 7 !remove sentinels + 1 overwrite on
+#     hdfs-site.xml, plus 1 !remove + 1 overwrite on core-site.xml.
+#     These ARE the documented "Simple auth recipe" env vars; the
+#     test confirms each one landed. Together with the kerberos
+#     case this gives 100% envtoxml code-path coverage from smoke.
+# ---------------------------------------------------------------------
+HDFS_XML=/opt/hadoop/etc/hadoop/hdfs-site.xml
+CORE_XML=/opt/hadoop/etc/hadoop/core-site.xml
+HDFS_XML_CONTENT=$(docker exec "$SERVER" cat "${HDFS_XML}" 2>/dev/null || true)
+CORE_XML_CONTENT=$(docker exec "$SERVER" cat "${CORE_XML}" 2>/dev/null || true)
+if [ -z "$HDFS_XML_CONTENT" ] || [ -z "$CORE_XML_CONTENT" ]; then
+    echo "FAIL: could not read ${HDFS_XML} / ${CORE_XML} from container"
+    docker logs "$SERVER"
+    exit 1
+fi
+
+if [ "$MODE" = "kerberos" ]; then
+    echo "=== Verifying envtoxml injection (kerberos: append + overwrite + !remove) ==="
 
     # (a) APPEND: dfs.client.use.datanode.hostname=true — was NOT in
     # the template; envtoxml must append a new <property> for it.
-    APPEND_LINE=$(echo "$XML_CONTENT" \
+    APPEND_LINE=$(echo "$HDFS_XML_CONTENT" \
         | grep -o '<name>dfs.client.use.datanode.hostname</name><value>true</value>' || true)
     if [ -z "$APPEND_LINE" ]; then
         echo "FAIL: envtoxml did not append dfs.client.use.datanode.hostname=true"
-        echo "  grep: $APPEND_LINE"
         docker exec "$SERVER" cat "${HDFS_XML}" || true
         exit 1
     fi
@@ -266,12 +359,12 @@ if [ "$MODE" = "kerberos" ]; then
     # (b) OVERWRITE: dfs.replication=2 — template had =1; the entry
     # count for that key must be exactly 1 (no duplicate from a
     # broken merge) AND its value must be 2.
-    REPL_COUNT=$(echo "$XML_CONTENT" | grep -c 'dfs\.replication' || true)
+    REPL_COUNT=$(echo "$HDFS_XML_CONTENT" | grep -c 'dfs\.replication' || true)
     if [ "$REPL_COUNT" != "1" ]; then
         echo "FAIL: envtoxml left ${REPL_COUNT} dfs.replication entries (want 1)"
         exit 1
     fi
-    REPL_LINE=$(echo "$XML_CONTENT" \
+    REPL_LINE=$(echo "$HDFS_XML_CONTENT" \
         | grep -o '<name>dfs.replication</name><value>2</value>' || true)
     if [ -z "$REPL_LINE" ]; then
         echo "FAIL: envtoxml did not overwrite dfs.replication to 2"
@@ -282,19 +375,93 @@ if [ "$MODE" = "kerberos" ]; then
 
     # (c) REMOVE: dfs.namenode.secondary.http-address=!remove — was
     # in the template (=0.0.0.0:0); the property must be GONE.
-    if echo "$XML_CONTENT" | grep -q 'dfs.namenode.secondary.http-address'; then
+    if echo "$HDFS_XML_CONTENT" | grep -q 'dfs.namenode.secondary.http-address'; then
         echo "FAIL: envtoxml did not delete dfs.namenode.secondary.http-address (!remove)"
         docker exec "$SERVER" grep 'secondary.http-address' "${HDFS_XML}" || true
         exit 1
     fi
     # </configuration> must still be present — a botched truncate
     # could leave the file tail-broken; quick structural sanity.
-    if ! echo "$XML_CONTENT" | grep -q '</configuration>'; then
+    if ! echo "$HDFS_XML_CONTENT" | grep -q '</configuration>'; then
         echo "FAIL: envtoxml left hdfs-site.xml without </configuration> close tag"
         docker exec "$SERVER" tail -5 "${HDFS_XML}" || true
         exit 1
     fi
     echo "  remove  ok: dfs.namenode.secondary.http-address gone, file still well-formed"
+fi
+
+if [ "$MODE" = "simple" ]; then
+    echo "=== Verifying envtoxml injection (simple: 7 !remove + 2 overwrite) ==="
+
+    # (a) 7 kerberos-only properties must be GONE from hdfs-site.xml.
+    #     Each is a keytab path, an SPN, or a SASL transport
+    #     setting that has no analogue in Simple auth and would
+    #     cause Hadoop to fail to start if left in.
+    SIMPLE_REMOVED_KEYS=(
+        dfs.namenode.kerberos.principal
+        dfs.namenode.keytab.file
+        dfs.datanode.kerberos.principal
+        dfs.datanode.keytab.file
+        dfs.web.authentication.kerberos.principal
+        dfs.web.authentication.kerberos.keytab
+        dfs.data.transfer.protection
+    )
+    for k in "${SIMPLE_REMOVED_KEYS[@]}"; do
+        if echo "$HDFS_XML_CONTENT" | grep -q "<name>${k}</name>"; then
+            echo "FAIL: envtoxml did not !remove ${k} from hdfs-site.xml"
+            docker exec "$SERVER" grep "${k}" "${HDFS_XML}" || true
+            exit 1
+        fi
+    done
+    echo "  !remove ok: 7 kerberos-only properties gone from hdfs-site.xml"
+
+    # (b) 1 OVERWRITE on hdfs-site.xml: dfs.block.access.token.enable
+    # template had =true; env var =false must take effect AND no
+    # duplicate entry.
+    BAC_COUNT=$(echo "$HDFS_XML_CONTENT" | grep -c 'dfs\.block\.access\.token\.enable' || true)
+    if [ "$BAC_COUNT" != "1" ]; then
+        echo "FAIL: envtoxml left ${BAC_COUNT} dfs.block.access.token.enable entries (want 1)"
+        exit 1
+    fi
+    if ! echo "$HDFS_XML_CONTENT" \
+        | grep -q '<name>dfs.block.access.token.enable</name><value>false</value>'; then
+        echo "FAIL: envtoxml did not overwrite dfs.block.access.token.enable to false"
+        docker exec "$SERVER" grep 'block.access.token.enable' "${HDFS_XML}" || true
+        exit 1
+    fi
+    echo "  overwrite ok: dfs.block.access.token.enable=true → false (single entry)"
+
+    # (c) 1 !remove + 1 overwrite on core-site.xml.
+    if echo "$CORE_XML_CONTENT" | grep -q '<name>hadoop.rpc.protection</name>'; then
+        echo "FAIL: envtoxml did not !remove hadoop.rpc.protection from core-site.xml"
+        docker exec "$SERVER" grep 'rpc.protection' "${CORE_XML}" || true
+        exit 1
+    fi
+    echo "  !remove ok: hadoop.rpc.protection gone from core-site.xml"
+
+    AUTHZ_COUNT=$(echo "$CORE_XML_CONTENT" | grep -c 'hadoop\.security\.authorization' || true)
+    if [ "$AUTHZ_COUNT" != "1" ]; then
+        echo "FAIL: envtoxml left ${AUTHZ_COUNT} hadoop.security.authorization entries (want 1)"
+        exit 1
+    fi
+    if ! echo "$CORE_XML_CONTENT" \
+        | grep -q '<name>hadoop.security.authorization</name><value>false</value>'; then
+        echo "FAIL: envtoxml did not overwrite hadoop.security.authorization to false"
+        docker exec "$SERVER" grep 'security.authorization' "${CORE_XML}" || true
+        exit 1
+    fi
+    echo "  overwrite ok: hadoop.security.authorization=true → false (single entry)"
+
+    # Both XMLs must still be well-formed end-to-end.
+    if ! echo "$HDFS_XML_CONTENT" | grep -q '</configuration>'; then
+        echo "FAIL: hdfs-site.xml missing </configuration> close after envtoxml merges"
+        exit 1
+    fi
+    if ! echo "$CORE_XML_CONTENT" | grep -q '</configuration>'; then
+        echo "FAIL: core-site.xml missing </configuration> close after envtoxml merges"
+        exit 1
+    fi
+    echo "  structural ok: both XMLs still well-formed"
 fi
 
 if [ "$MODE" = "kerberos" ]; then
