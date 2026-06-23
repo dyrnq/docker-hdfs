@@ -8,3 +8,7 @@ docker-compose*.yml
 Makefile
 tests
 scripts
+# Rust build artifacts from tools/envtoxml/ — the builder stage compiles
+# fresh, so copying the host's target/ is pure waste and can shadow the
+# container build. Keep Cargo.toml + Cargo.lock + src/ + tests/.
+tools/envtoxml/target
