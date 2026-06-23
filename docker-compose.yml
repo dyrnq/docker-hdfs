@@ -32,7 +32,6 @@ services:
       KRB5_KDC: ${KRB5_KDC:-hdfs.test}
       KRB5_DOMAIN: ${KRB5_DOMAIN:-test}
       HDFS_NAMENODE_RPC_PORT: 8020
-      HDFS_NAMENODE_HTTPS_PORT: 9871
     volumes:
       - hdfs-data-debian:/var/lib/hadoop
       - hdfs-kdc-debian:/var/lib/krb5kdc
@@ -64,7 +63,6 @@ services:
       KRB5_KDC: ${KRB5_KDC:-hdfs.test}
       KRB5_DOMAIN: ${KRB5_DOMAIN:-test}
       HDFS_NAMENODE_RPC_PORT: 8020
-      HDFS_NAMENODE_HTTPS_PORT: 9871
     volumes:
       - hdfs-data-ubuntu:/var/lib/hadoop
       - hdfs-kdc-ubuntu:/var/lib/krb5kdc
