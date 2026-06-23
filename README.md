@@ -406,17 +406,50 @@ In `simple` mode, the script:
   resolves the DN hostname via A-only) got `ECONNREFUSED` on the
   registered IPv4 `ip_addr`. The image now ships
   `dfs.datanode.address=__HDFS_HOSTNAME__:port` (and the matching
-  `http-address` / `https-address`) plus `dfs.datanode.bind-host=0.0.0.0`,
-  which makes the DN bind a **non-IPv6-wildcard** address — in
-  practice an IPv4-mapped IPv6 socket on `::ffff:<resolved-ip>:port`
-  in `/proc/net/tcp6` (FFFF0000 prefix). The kernel still routes
-  IPv4 input to that socket on a dual-stack system, so IPv4 clients
-  can connect; the regression-test (smoke) verifies the bind is
-  not the pure `[::]:port` form. `bind-host` covers ALL DN sockets
-  (data 9866, http 9864, https 9865, ipc 9867) as a single switch
-  (Hadoop 3.3.0+, see `DFSConfigKeys.DFS_DATANODE_BIND_HOST_KEY`).
-  **k8s caveat** is the same as issue #8: `HDFS_HOSTNAME` must
-  resolve to the pod IP. Override at runtime with
+  `http-address` / `https-address`), which makes the DN bind a
+  **non-IPv6-wildcard** address — in practice an IPv4-mapped IPv6
+  socket on `::ffff:<resolved-ip>:port` in `/proc/net/tcp6`
+  (FFFF0000 prefix). The kernel still routes IPv4 input to that
+  socket on a dual-stack system, so IPv4 clients can connect; the
+  regression-test (smoke) verifies the bind is not the pure
+  `[::]:port` form. Note: this image does **not** ship
+  `dfs.datanode.bind-host=0.0.0.0` — `DFS_DATANODE_BIND_HOST_KEY`
+  does not exist in Hadoop 3.5.0 (only NN / Balancer / JournalNode
+  / Provided-aliasmap have bind-host keys; DN does not), so the
+  `hostname:port` pattern alone is what protects streaming + IPC +
+  HTTPS sockets. **k8s caveat** is the same as issue #8:
+  `HDFS_HOSTNAME` must resolve to the pod IP. Override at runtime
+  with
   `-e HDFS-SITE.XML_dfs.datanode.address=<pod-ip>:<port> \
-  -e HDFS-SITE.XML_dfs.datanode.bind-host=0.0.0.0`.
+   -e HDFS-SITE.XML_dfs.datanode.http.address=<pod-ip>:9864 \
+   -e HDFS-SITE.XML_dfs.datanode.https.address=<pod-ip>:9865`.
+- **DataNode info-web server bind crash on IPv6-only pods** (GitHub
+  issue #12, upstream bug): the DataNode opens an additional
+  listener for the info web UI, separate from the data / IPC / HTTPS
+  sockets. The Jetty builder in
+  `org.apache.hadoop.hdfs.server.datanode.web.DatanodeHttpServer`
+  hard-codes
+  `addEndpoint(URI.create("http://localhost:" + proxyPort))` and
+  `setFindPort(true)`, so `proxyPort` is ephemeral and the bind
+  address is the literal string `"localhost"` — no config, env var,
+  or system property reaches it. On Debian 13 + OpenJDK 21 + k8s
+  `hostNetwork: true` pods whose netns has no `[::1]` route,
+  `InetAddress.getByName("localhost")` returns `[::1]` first
+  (`net.ipv6.bindv6only=0`), Jetty tries `bind([::1]:0)`, and the
+  kernel returns `EADDRNOTAVAIL`. The DataNode then shuts down
+  (`BindException: Failed to bind to /[0:0:0:0:0:0:0:1]:0`). The
+  image does **not** default `preferIPv4Stack=true` — opt in per
+  container when you hit the crash:
+  ```bash
+  -e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true
+  ```
+  This forces `getByName("localhost")` to return `127.0.0.1` (always
+  routable in the pod's netns), so the info-web server binds
+  `127.0.0.1:<ephemeral>` and proceeds. The flag is JVM-wide, so
+  other daemons in the container (NN / KDC) also resolve hostnames
+  IPv4-first; they don't bind `localhost`, so it has no observable
+  effect on them. Once upstream fixes
+  `DatanodeHttpServer.java:122` (replacing `"localhost"` with
+  `DFS_DATANODE_BIND_HOST_KEY`-derived value), this opt-in can be
+  removed.
 

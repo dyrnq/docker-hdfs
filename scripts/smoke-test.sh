@@ -222,9 +222,10 @@ fi
 # recorded ip_addr=127.0.0.1; cross-pod clients (CSI, opendal,
 # hdfs-native) then fail to read blocks. The template now uses
 # __HDFS_HOSTNAME__:port + rpc-bind-host=0.0.0.0, so the IP recorded
-# should be the container's real interface IP. Simple mode mounts the
-# XMLs :ro from scripts/conf/simple/, which carries the same fix; this
-# check catches a regression in either path.
+# should be the container's real interface IP. Simple mode passes the
+# same value via env (HDFS-SITE.XML_dfs.namenode.rpc-address), which
+# carries the same fix; this check catches a regression in either
+# path.
 #
 # Hadoop 3.x reports each DN as "Name: <ip>:<port> (<hostname>)" on
 # its own line; we read the live report and assert no Name/IP pair
@@ -256,9 +257,12 @@ echo "  DataNode Name: $FIRST_IP"
 # only an IPv6 listener. IPv4-only clients (opendal, hdfs-native,
 # anything that resolves A-only) then get ECONNREFUSED on the
 # registered ip_addr. The fix: dfs.datanode.address=hostname:port
-# + dfs.datanode.bind-host=0.0.0.0 makes the DN bind a non-IPv6-
-# wildcard address (in practice an IPv4-mapped IPv6 socket on
-# ::ffff:<resolved-ip>), which the kernel routes to on IPv4 input.
+# makes the DN bind a non-IPv6-wildcard address (in practice an
+# IPv4-mapped IPv6 socket on ::ffff:<resolved-ip>), which the
+# kernel routes to on IPv4 input. dfs.datanode.bind-host does NOT
+# exist in Hadoop 3.5.0 (only NN/Balancer/JN/Provided-aliasmap
+# have bind-host keys) so the hostname pattern alone is what
+# protects streaming + IPC + HTTPS sockets.
 #
 # Detection: a LISTEN on the port that is NOT the pure IPv6 wildcard
 # `00000000000000000000000000000000` is acceptable. The original bug
