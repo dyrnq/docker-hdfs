@@ -82,14 +82,48 @@ make build-ubuntu up-ubuntu
 | `KRB5_DOMAIN`                | no       | `test`       | Used in `krb5.conf` `domain_realm` mapping. |
 | `KRB5_PASS`                  | no       | auto-gen     | Master + admin principal password. Auto-generated on first boot and stored at `/var/lib/krb5kdc/.krb5_pass` (mode 0600 root:root) **inside the KDC volume**, so the password survives `docker rm` + `docker run -v ...:/var/lib/krb5kdc` recreate cycles and stays in sync with the encrypted KDC database. Retrieve with `docker exec hdfs cat /var/lib/krb5kdc/.krb5_pass`. Not echoed to `docker logs` to avoid credential leakage. On subsequent boots the entrypoint reads the file back if `KRB5_PASS` is not passed via env. |
 | `KRB5_TESTUSER_PASS`         | no       | `testpass`   | Password for the `testuser@REALM` principal that the entrypoint creates. Intentionally weak by default — the principal exists for the smoke test, not for real use. Override before exposing this image outside a dev/test boundary. |
-| `HDFS_NAMENODE_RPC_PORT`     | no       | `8020`       | NameNode RPC port. |
-| `HDFS_NAMENODE_HTTPS_PORT`   | no       | `9871`       | NameNode HTTPS port. |
+| `HDFS_NAMENODE_RPC_PORT`     | no       | `8020`       | NameNode RPC port. Drives `dfs.namenode.rpc-address` + `fs.defaultFS` (shared) and the `dfsadmin -report` wait poll. |
 | `HDFS_NAMENODE_AUTO_FORMAT`  | no       | `true`       | If `true` (default), the NameNode formats on first boot when `/var/lib/hadoop/namenode/current` is missing. Set to `false` to disable silent auto-format (e.g. when mounting a pre-formatted volume that must not be touched). |
 | `HDFS_NAMENODE_FORCE_FORMAT` | no       | `false`      | If `true`, the NameNode formats unconditionally on every boot, wiping any existing fsimage. Destructive. Takes priority over `AUTO_FORMAT`. |
 | `HADOOP_SECURITY_AUTHENTICATION` | no   | `kerberos`  | `kerberos` (default, embedded KDC) or `simple`. In `simple` mode the entrypoint (a) strips the `krb5kdc` + `kadmind` s6 services and (b) skips KDC bootstrap, keytab generation, and the self-signed keystore. The sed substitution below also rewrites `hadoop.security.authentication` in `core-site.xml` from the `__HADOOP_SECURITY_AUTHENTICATION__` placeholder to `simple`, which is enough to flip the s6 run scripts (`hdfs-common.sh: hdfs_auth_mode` reads the XML as the source of truth — defensive against a typo'd or hand-edited XML). The sed substitution does NOT touch the rest of the XML: `core-site.xml` keeps `hadoop.security.authorization=true` and `hadoop.rpc.protection=authentication`, and `hdfs-site.xml` keeps the kerberos principal/keytab/block-token properties. Those are harmless without a KDC (the principals never resolve, `dfs.http.policy` defaults to HTTP_ONLY so the missing keystore is fine), but operators who want a clean Simple-auth cluster should bind-mount `core-site.xml` + `hdfs-site.xml` containing `Simple` + `HTTP_ONLY` + no kerberos properties — see `scripts/conf/simple/` for a working pair. |
 | `HDFS_KDC_WAIT_TIMEOUT`      | no       | `30`         | Number of attempts (≈2× wall seconds) the namenode + datanode run scripts poll the KDC port 88 for, before giving up with a FATAL log line. |
 | `HDFS_NAMENODE_WAIT_TIMEOUT` | no       | `60`         | Number of attempts (≈2× wall seconds) the datanode run script polls `dfsadmin -report` for, before giving up with a FATAL log line. |
 | `KEYSTORE_PASS`              | no       | `changeit`   | HTTPS self-signed keystore password. Ignored in simple mode (no keystore generated). |
+
+### Injecting arbitrary Hadoop XML config (`<NAME>.XML_<key>`)
+
+For everything else, any env var named `<NAME>.XML_<hadoop-key>=<value>`
+is merged into `<name>.xml` at container start (inspired by
+[apache/ozone](https://github.com/apache/ozone)'s `envtoconf` convention,
+reimplemented here as a static Rust binary — `tools/envtoxml/` — so the
+image needs no python3). For example:
+
+```bash
+docker run -e HDFS-SITE.XML_dfs.client.use.datanode.hostname=true \
+           -e CORE-SITE.XML_fs.trash.interval=60 \
+           dyrnq/hdfs:latest
+```
+
+- `HDFS-SITE.XML_…` targets `hdfs-site.xml`, `CORE-SITE.XML_…` targets
+  `core-site.xml`; the `<NAME>` prefix (case-insensitive) selects the
+  file by its basename minus `.xml`. Any `*.xml` under
+  `/opt/hadoop/etc/hadoop/` is a valid target.
+- A key already in the XML has its `<value>` **overwritten in place** (the
+  `<property>` is not duplicated); a new key is **appended** before
+  `</configuration>`. Comments and whitespace are preserved byte-for-byte.
+- To **delete** a template-defined property, set its value to the sentinel
+  `!remove`: `-e HDFS-SITE.XML_dfs.namenode.kerberos.principal=!remove`
+  drops that `<property>` entirely (no-op if the key is absent). The
+  sentinel goes in the value, not the name — env names are restricted to
+  `[-._a-zA-Z0-9]` (k8s ConfigMap keys reject `!`).
+- Values are XML-escaped (`& < >` …); config keys must match
+  `[A-Za-z0-9._-]` (others are skipped with a warning). Read-only
+  (bind-mounted) XMLs are left untouched — mount your own XML and you are
+  fully in charge.
+
+The most common use is overriding `dfs.namenode.rpc-address` in k8s (see
+the Notes below).
+
 
 ## Build args
 
@@ -167,6 +201,20 @@ hdfs dfs -ls hdfs://hdfs.test:8020/
 the UI over plain HTTP. To use `https://<host>:9871`, switch the policy
 to `HTTPS_ONLY` or `HTTP_AND_HTTPS` (the self-signed keystore is
 generated on first boot for exactly this — see Notes).
+
+## Development
+
+Run the envtoxml Rust crate's format check + tests locally:
+
+```bash
+make test-envtoxml       # or: cd tools/envtoxml && cargo fmt --check && cargo test
+```
+
+The same checks run in CI as the `lint` job (see
+`.github/workflows/docker.yml`), so this catches the regressions CI
+would catch — fmt drift and broken tests — before pushing. The Docker
+build still recompiles envtoxml from source in its builder stage; no
+separate build step is needed for the binary to land in the image.
 
 ## Smoke test
 
@@ -296,3 +344,24 @@ In `simple` mode, the script:
   skips the write-back silently and Hadoop reads the mounted
   XML directly. Operators who mount-override their own XMLs get
   the same behavior for free.
+- **DataNode `ip_addr` / `dfs.namenode.rpc-address`** (GitHub issue #8):
+  the NameNode records a DataNode's `ip_addr` as the **source IP of the
+  DataNode→NameNode registration RPC** (Hadoop
+  `DatanodeManager.registerDatanode` overwrites it — see the source refs
+  in the `hdfs-site.xml` comment). With `dfs.namenode.rpc-address=0.0.0.0`
+  the DataNode connects over loopback, so `ip_addr` is recorded as
+  `127.0.0.1`, which breaks cross-pod clients (CSI nodeplugins,
+  `opendal`/`hdfs-native`) that connect to DataNodes by `ip_addr`. The
+  image therefore ships `dfs.namenode.rpc-address=__HDFS_HOSTNAME__:port`
+  plus `dfs.namenode.rpc-bind-host=0.0.0.0`: the advertised address drives
+  the registered `ip_addr` (= `resolve(HDFS_HOSTNAME)`), while the bind
+  host keeps the NameNode listening on all interfaces. **k8s caveat**:
+  `HDFS_HOSTNAME` (and the container `--hostname`) must resolve to the pod
+  IP — a short name mapped to `127.0.0.1` in `/etc/hosts` (a common k8s
+  pod default) defeats this, so use the pod's headless-Service FQDN or set
+  `HDFS_HOSTNAME` to the pod IP. (Note: `dfs.datanode.hostname` only sets
+  the `host_name` field, not `ip_addr`; `dfs.datanode.dns.interface` does
+  neither — both were investigated and ruled out in issue #8.) Override
+  at runtime without a rebuild with
+  `-e HDFS-SITE.XML_dfs.namenode.rpc-address=<pod-ip>:<port>`.
+
