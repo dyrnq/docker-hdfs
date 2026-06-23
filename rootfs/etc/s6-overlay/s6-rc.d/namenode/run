@@ -8,6 +8,37 @@ export JAVA_HOME="${JAVA_HOME:?JAVA_HOME must be set by the Dockerfile}"
 export HADOOP_HOME="${HADOOP_HOME:-/opt/hadoop}"
 export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.conf=/etc/krb5.conf"
 
+# Per-daemon Hadoop log files.
+#
+# We run the NameNode in the FOREGROUND under s6 (s6 must see the
+# process stay alive to supervise it), so we deliberately do NOT use
+# `hdfs --daemon start namenode`. That matters for logging: Hadoop's
+# own per-daemon code path (hadoop-functions.sh:hadoop_daemon_handler,
+# gated on HADOOP_DAEMON_MODE != "default") is what would otherwise
+#   (a) set HADOOP_LOGFILE to the per-daemon
+#       hadoop-<ident>-<subcmd>-<host>.log name, AND
+#   (b) switch HADOOP_ROOT_LOGGER to the daemon RFA (rolling file)
+#       appender.
+# Because we're in the default (foreground) mode, that path never
+# runs — the daemons fall back to HADOOP_LOGFILE=hadoop.log (shared
+# across all daemons) and HADOOP_ROOT_LOGGER=INFO,console (stdout
+# only), so NO per-daemon log files ever land in /opt/hadoop/logs.
+#
+# We replicate the daemon naming + RFA appender here by hand: each
+# daemon writes its own rolling file (RFA →
+# ${HADOOP_LOG_DIR}/${HADOOP_LOGFILE}) AND still streams to stdout
+# via the console appender (→ docker logs, so the catch-all stream
+# keeps working for `docker logs`). See GitHub issue #9.
+#
+# These are scoped to the daemon run scripts (NOT hadoop-env.sh) so
+# short-lived client commands — e.g. the dfsadmin -report polls in
+# hdfs-common.sh — keep the INFO,console default and don't litter
+# /opt/hadoop/logs/hadoop.log with 60× client-startup noise per
+# wait loop.
+export HADOOP_LOG_DIR="${HADOOP_LOG_DIR:-/opt/hadoop/logs}"
+export HADOOP_LOGFILE="hadoop-hdfs-namenode-${HOSTNAME:-$(hostname)}.log"
+export HADOOP_ROOT_LOGGER="${HADOOP_ROOT_LOGGER:-INFO,console,RFA}"
+
 # HDFS_HOSTNAME is the hostname baked into the kerberos principal;
 # use it as the kinit principal name.
 : "${HDFS_HOSTNAME:=localhost}"

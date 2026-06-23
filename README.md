@@ -258,6 +258,28 @@ In `simple` mode, the script:
   names are stripped before the new ones are appended, so
   repeated restarts do not accumulate duplicates on the
   persistent `/opt/hadoop` volume.
+- Each Hadoop daemon writes its own rolling log file under
+  `/opt/hadoop/logs/`:
+  `hadoop-hdfs-namenode-<host>.log` and
+  `hadoop-hdfs-datanode-<host>.log`. The daemons run in the
+  FOREGROUND under s6 (so s6 can supervise them), which means
+  Hadoop's own `--daemon` code path — the one that would normally
+  pick the per-daemon log filename and switch to the RFA
+  (rolling-file) appender — never fires. The namenode + datanode
+  run scripts therefore set `HADOOP_LOGFILE` (per-daemon name) and
+  `HADOOP_ROOT_LOGGER=INFO,console,RFA` by hand so each daemon
+  lands a file AND still streams to stdout (`→ docker logs`).
+  These two are scoped to the run scripts (not `hadoop-env.sh`)
+  so short-lived client calls like the `dfsadmin -report` polls
+  keep the `INFO,console` default and don't litter
+  `/opt/hadoop/logs/hadoop.log`. The KDC daemons log separately to
+  `/var/log/krb5/` via `kdc.conf` `[logging]`. So every daemon has
+  an on-disk, rotated log file; `docker logs` remains the live
+  aggregate stream. Note `/opt/hadoop/logs` lives in the image's
+  writable layer (it is NOT one of the volumes above), so these
+  files are ephemeral across `docker rm` + recreate — `docker logs`
+  is the cross-restart record. Mount `/opt/hadoop/logs` yourself if
+  you need the Hadoop files to survive. (GitHub issue #9.)
 - `krb5.conf`, `core-site.xml`, and `hdfs-site.xml` ship inside
   the `rootfs/` tree (`rootfs/etc/krb5.conf` and
   `rootfs/opt/hadoop/etc/hadoop/`) and are copied by the single

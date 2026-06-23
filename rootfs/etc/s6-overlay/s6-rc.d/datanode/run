@@ -7,6 +7,16 @@ export JAVA_HOME="${JAVA_HOME:?JAVA_HOME must be set by the Dockerfile}"
 export HADOOP_HOME="${HADOOP_HOME:-/opt/hadoop}"
 export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.conf=/etc/krb5.conf"
 
+# Per-daemon Hadoop log files — see namenode/run for the full
+# rationale (short version: we run foreground, not `--daemon`, so
+# Hadoop's own per-daemon log-naming + RFA-appender path never
+# fires; we replicate it here so /opt/hadoop/logs gets
+# hadoop-hdfs-datanode-<host>.log while stdout still goes to
+# docker logs). GitHub issue #9.
+export HADOOP_LOG_DIR="${HADOOP_LOG_DIR:-/opt/hadoop/logs}"
+export HADOOP_LOGFILE="hadoop-hdfs-datanode-${HOSTNAME:-$(hostname)}.log"
+export HADOOP_ROOT_LOGGER="${HADOOP_ROOT_LOGGER:-INFO,console,RFA}"
+
 : "${HDFS_HOSTNAME:=localhost}"
 : "${HDFS_NAMENODE_RPC_PORT:=8020}"
 # Default the namenode host to HDFS_HOSTNAME (not localhost): the
