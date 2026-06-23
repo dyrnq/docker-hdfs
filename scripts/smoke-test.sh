@@ -66,6 +66,19 @@ docker network create "$NET" >/dev/null
 if [ "$MODE" = "kerberos" ]; then
     # Standard launch: let the entrypoint bootstrap KDC, principals,
     # keytab, and the hadoop XML configs.
+    #
+    # The envtoxml feature is exercised here too: the kerberos-mode
+    # XML at /opt/hadoop/etc/hadoop/hdfs-site.xml is the image's own
+    # copy (writable), so envtoxml runs and the overrides land. We
+    # pick three properties that exercise all three code paths —
+    # append (new key), overwrite (existing key, different value),
+    # and !remove (existing key, sentinel value) — and that are safe
+    # to mutate without breaking the kerberos auth path:
+    #   dfs.client.use.datanode.hostname=true  → new key (append)
+    #   dfs.replication=2                       → exists as 1 → overwrite
+    #   dfs.namenode.secondary.http-address     → exists → !remove
+    #     (no SecondaryNameNode runs here, removing it is a no-op)
+    # See the envtoxml block below for the in-container verification.
     echo "=== Starting container (kerberos) ==="
     docker run -d --name "$SERVER" \
         --network "$NET" \
@@ -74,6 +87,9 @@ if [ "$MODE" = "kerberos" ]; then
         -e KRB5_REALM="$REALM" \
         -e KRB5_KDC="$HOST" \
         -e "KRB5_TESTUSER_PASS=${KRB5_TESTUSER_PASS:-testpass}" \
+        -e "HDFS-SITE.XML_dfs.client.use.datanode.hostname=true" \
+        -e "HDFS-SITE.XML_dfs.replication=2" \
+        -e "HDFS-SITE.XML_dfs.namenode.secondary.http-address=!remove" \
         "$IMAGE"
 else
     # Simple auth launch: run the normal entrypoint but pass
@@ -179,6 +195,106 @@ if [ -z "$COUNT" ] || [ "$COUNT" -lt 1 ]; then
     echo "  final: $LIVE_DNS"
     docker logs "$SERVER"
     exit 1
+fi
+
+# ---------------------------------------------------------------------
+# Issue #8 regression: the DataNode's registered ip_addr must NOT be
+# 127.0.0.1. With dfs.namenode.rpc-address=0.0.0.0 (the old template
+# default) the DN→NN registration RPC traversed loopback and the NN
+# recorded ip_addr=127.0.0.1; cross-pod clients (CSI, opendal,
+# hdfs-native) then fail to read blocks. The template now uses
+# __HDFS_HOSTNAME__:port + rpc-bind-host=0.0.0.0, so the IP recorded
+# should be the container's real interface IP. Simple mode mounts the
+# XMLs :ro from scripts/conf/simple/, which carries the same fix; this
+# check catches a regression in either path.
+#
+# Hadoop 3.x reports each DN as "Name: <ip>:<port> (<hostname>)" on
+# its own line; we read the live report and assert no Name/IP pair
+# starts with 127.
+# ---------------------------------------------------------------------
+echo "=== Verifying DataNode ip_addr is not 127.0.0.1 (issue #8) ==="
+REPORT=$(docker exec "$SERVER" gosu hdfs \
+    /opt/hadoop/bin/hdfs dfsadmin -fs "hdfs://${HOST}:8020" -report 2>/dev/null || true)
+LOOPBACK_DN=$(echo "$REPORT" \
+    | grep -E '^Name: 127\.' || true)
+if [ -n "$LOOPBACK_DN" ]; then
+    echo "FAIL: DataNode registered with loopback ip_addr (issue #8 regression)"
+    echo "$LOOPBACK_DN" | sed 's/^/  /'
+    docker logs "$SERVER"
+    exit 1
+fi
+# Surface the actual IP we got — useful diagnostic when this fails
+# outside CI (no log retention).
+FIRST_IP=$(echo "$REPORT" | grep -E '^Name: ' | head -1 | awk '{print $2}' || true)
+echo "  DataNode Name: $FIRST_IP"
+
+# ---------------------------------------------------------------------
+# envtoxml feature check (kerberos mode only — simple mode mounts
+# the XMLs :ro, so envtoxml's [ -w ] guard skips them; the append /
+# overwrite / !remove code paths need a writable XML). The three
+# values passed at docker run time must all be reflected in
+# /opt/hadoop/etc/hadoop/hdfs-site.xml after the entrypoint applies
+# envtoxml — confirming each code path end-to-end.
+#
+# We use `grep -c <name>` rather than parsing XML because the goal is
+# "did envtoxml apply the change", not "is the XML schema-valid".
+# Format-agnostic, and the surrounding `<value>...</value>` substring
+# check confirms the value landed in the right element.
+# ---------------------------------------------------------------------
+if [ "$MODE" = "kerberos" ]; then
+    echo "=== Verifying envtoxml injection (append + overwrite + !remove) ==="
+    HDFS_XML=/opt/hadoop/etc/hadoop/hdfs-site.xml
+    XML_CONTENT=$(docker exec "$SERVER" cat "${HDFS_XML}" 2>/dev/null || true)
+    if [ -z "$XML_CONTENT" ]; then
+        echo "FAIL: could not read ${HDFS_XML} from container"
+        docker logs "$SERVER"
+        exit 1
+    fi
+
+    # (a) APPEND: dfs.client.use.datanode.hostname=true — was NOT in
+    # the template; envtoxml must append a new <property> for it.
+    APPEND_LINE=$(echo "$XML_CONTENT" \
+        | grep -o '<name>dfs.client.use.datanode.hostname</name><value>true</value>' || true)
+    if [ -z "$APPEND_LINE" ]; then
+        echo "FAIL: envtoxml did not append dfs.client.use.datanode.hostname=true"
+        echo "  grep: $APPEND_LINE"
+        docker exec "$SERVER" cat "${HDFS_XML}" || true
+        exit 1
+    fi
+    echo "  append  ok: dfs.client.use.datanode.hostname=true"
+
+    # (b) OVERWRITE: dfs.replication=2 — template had =1; the entry
+    # count for that key must be exactly 1 (no duplicate from a
+    # broken merge) AND its value must be 2.
+    REPL_COUNT=$(echo "$XML_CONTENT" | grep -c 'dfs\.replication' || true)
+    if [ "$REPL_COUNT" != "1" ]; then
+        echo "FAIL: envtoxml left ${REPL_COUNT} dfs.replication entries (want 1)"
+        exit 1
+    fi
+    REPL_LINE=$(echo "$XML_CONTENT" \
+        | grep -o '<name>dfs.replication</name><value>2</value>' || true)
+    if [ -z "$REPL_LINE" ]; then
+        echo "FAIL: envtoxml did not overwrite dfs.replication to 2"
+        docker exec "$SERVER" grep 'dfs.replication' "${HDFS_XML}" || true
+        exit 1
+    fi
+    echo "  overwrite ok: dfs.replication=1 → 2 (single entry, no dup)"
+
+    # (c) REMOVE: dfs.namenode.secondary.http-address=!remove — was
+    # in the template (=0.0.0.0:0); the property must be GONE.
+    if echo "$XML_CONTENT" | grep -q 'dfs.namenode.secondary.http-address'; then
+        echo "FAIL: envtoxml did not delete dfs.namenode.secondary.http-address (!remove)"
+        docker exec "$SERVER" grep 'secondary.http-address' "${HDFS_XML}" || true
+        exit 1
+    fi
+    # </configuration> must still be present — a botched truncate
+    # could leave the file tail-broken; quick structural sanity.
+    if ! echo "$XML_CONTENT" | grep -q '</configuration>'; then
+        echo "FAIL: envtoxml left hdfs-site.xml without </configuration> close tag"
+        docker exec "$SERVER" tail -5 "${HDFS_XML}" || true
+        exit 1
+    fi
+    echo "  remove  ok: dfs.namenode.secondary.http-address gone, file still well-formed"
 fi
 
 if [ "$MODE" = "kerberos" ]; then
