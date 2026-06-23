@@ -2,8 +2,7 @@
 //!
 //! Each test writes a small XML fixture to a temp file, invokes the
 //! compiled binary with crafted env vars, and asserts on the merged
-//! result. The binary path comes from the `CARGO_BIN_EXE_envtoxml`
-//! env var that cargo sets for integration tests.
+//! result.
 //!
 //! Run:  cargo test  (from tools/envtoxml/)
 
@@ -12,10 +11,42 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Locate the compiled envtoxml binary the tests will invoke.
+///
+/// We try `CARGO_BIN_EXE_envtoxml` first — the official cargo hook
+/// for finding same-package binaries from integration tests, and the
+/// form recommended by the cargo book. Newer cargo (1.43+ in general,
+/// 1.96 verified here) sets it automatically.
+///
+/// Fallback: derive from `CARGO_MANIFEST_DIR` + the standard
+/// `target/<profile>/envtoxml` layout. Required for Cargo 1.83 (the
+/// toolchain pinned in `Dockerfile.{debian,ubuntu}`'s builder stage
+/// and the CI lint job) which does NOT set `CARGO_BIN_EXE_<name>` —
+/// verified by `env::vars()` dump from a rust:1.83-slim-bookworm
+/// container; only `CARGO_HOME`, `CARGO_MANIFEST_DIR`,
+/// `CARGO_MANIFEST_PATH`, and the `CARGO_PKG_*` family are set, no
+/// `CARGO_BIN_EXE_*`. We probe debug first, then release, so the
+/// fallback works for both `cargo test` and `cargo test --release`.
 fn bin() -> PathBuf {
-    env::var("CARGO_BIN_EXE_envtoxml")
-        .expect("CARGO_BIN_EXE_envtoxml not set")
-        .into()
+    if let Ok(p) = env::var("CARGO_BIN_EXE_envtoxml") {
+        return p.into();
+    }
+    let manifest = env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR not set — must run under cargo test");
+    let manifest = PathBuf::from(manifest);
+    for profile in ["debug", "release"] {
+        let candidate = manifest.join("target").join(profile).join("envtoxml");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    panic!(
+        "could not locate compiled envtoxml binary: tried \
+         CARGO_BIN_EXE_envtoxml, {}/target/debug/envtoxml, \
+         {}/target/release/envtoxml — run `cargo build` first",
+        manifest.display(),
+        manifest.display(),
+    );
 }
 
 /// Write `xml` to a fresh temp file named `hdfs-site.xml` and return its path.
