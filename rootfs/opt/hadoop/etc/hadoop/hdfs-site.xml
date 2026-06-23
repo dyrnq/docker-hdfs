@@ -4,32 +4,62 @@
 
     <property><name>dfs.namenode.kerberos.principal</name><value>hdfs/__HDFS_HOSTNAME__@__KRB5_REALM__</value></property>
     <property><name>dfs.namenode.keytab.file</name><value>/etc/hadoop/hdfs.keytab</value></property>
-    <property><name>dfs.namenode.rpc-address</name><value>0.0.0.0:__HDFS_NAMENODE_RPC_PORT__</value></property>
-    <property><name>dfs.namenode.https-address</name><value>0.0.0.0:__HDFS_NAMENODE_HTTPS_PORT__</value></property>
+    <!--
+        dfs.namenode.rpc-address + dfs.namenode.rpc-bind-host:
+        the advertised RPC address (what clients/DataNodes connect to)
+        is split from the bind address (what the socket listens on).
+
+        rpc-address = __HDFS_HOSTNAME__:port  — NOT 0.0.0.0. This
+        matters for the DataNode's registered ip_addr: the NameNode
+        OVERWRITES the DataNode's reported ipAddr with the source IP of
+        the DN→NN registration RPC (see DatanodeManager.registerDatanode,
+        DatanodeManager.java ~line 1204: nodeReg.setIpAddr(ip)). With
+        rpc-address=0.0.0.0 the DN connects to its NN over loopback
+        (0.0.0.0 resolves to 127.0.0.1), so the NN records ip_addr=
+        127.0.0.1 — which breaks every cross-pod client (CSI mounts,
+        opendal/hdfs-native) that connects to DataNodes by ip_addr.
+        Pointing rpc-address at __HDFS_HOSTNAME__ (resolved to the pod
+        IP) makes the DN connect over its real interface, so the NN
+        records the real IP. See GitHub issue #8.
+
+        rpc-bind-host = 0.0.0.0 — keeps the NameNode listening on ALL
+        interfaces (single-container dev/test, port-published docker,
+        etc.) regardless of what rpc-address advertises. Without this,
+        rpc-address=__HDFS_HOSTNAME__ would also narrow the bind to
+        that one IP. (NameNode.getRpcServerBindHost,
+        NameNode.java ~line 743.)
+
+        k8s caveat: __HDFS_HOSTNAME__ must resolve to the pod IP from
+        inside the pod. A short name mapped to 127.0.0.1 in /etc/hosts
+        (a common k8s pod default) defeats this — use the pod's
+        headless-Service FQDN or set HDFS_HOSTNAME to the pod IP. The
+        same value already drives the Kerberos principal and TLS cert
+        CN, so they stay aligned. To override at runtime without
+        rebuilding, set HDFS-SITE.XML_dfs.namenode.rpc-address=<ip>:<port>
+        (see the env→XML injection documented in README).
+    -->
+    <property><name>dfs.namenode.rpc-address</name><value>__HDFS_HOSTNAME__:__HDFS_NAMENODE_RPC_PORT__</value></property>
+    <property><name>dfs.namenode.rpc-bind-host</name><value>0.0.0.0</value></property>
+    <!-- HTTPS port baked in (was HDFS_NAMENODE_HTTPS_PORT; that special
+         env was removed — override via HDFS-SITE.XML_dfs.namenode.
+         https-address=0.0.0.0:<port> instead). -->
+    <property><name>dfs.namenode.https-address</name><value>0.0.0.0:9871</value></property>
 
     <property><name>dfs.datanode.kerberos.principal</name><value>hdfs/__HDFS_HOSTNAME__@__KRB5_REALM__</value></property>
     <property><name>dfs.datanode.keytab.file</name><value>/etc/hadoop/hdfs.keytab</value></property>
     <!--
-        dfs.datanode.hostname: the address the DataNode registers
-        with the NameNode (advertised as ip_addr / host:port in
-        dfsadmin -report, returned to clients in block-location
-        lookups). Without this, the DataNode auto-detects its IP at
-        startup, which in container runtimes (Docker, k8s) almost
-        always resolves to 127.0.0.1; clients then receive
-        127.0.0.1:9866, which from inside another pod is their own
-        loopback and breaks every cross-pod HDFS operation (CSI
-        mounts, distcp, etc.). Pin it to __HDFS_HOSTNAME__ (the
-        entrypoint substitutes this from the same env that already
-        drives fs.defaultFS, the Kerberos principal, and the TLS
-        cert CN) so the registered address stays consistent with
-        the principal, the cert, and what the consumer uses to
-        reach the cluster. Caveat: HDFS_HOSTNAME must be resolvable
-        from both the NameNode and every consumer (single-container
-        mode is fine; in k8s use the pod FQDN or a Service
-        DNS name). Consumers also need
-        dfs.client.use.datanode.hostname=true in their own
-        core-site.xml to use this hostname rather than fall back to
-        the still-127.0.0.1 IP.
+        dfs.datanode.hostname: sets ONLY the DatanodeID.hostName field
+        (the hostname shown by `dfsadmin -report` and returned to
+        Hadoop-native clients in block-location lookups). It does NOT
+        set ip_addr — that comes from the DN→NN registration RPC's
+        source IP (see the rpc-address comment above + issue #8).
+        Pinning it to __HDFS_HOSTNAME__ keeps the advertised hostname
+        consistent with the Kerberos principal / TLS cert CN / what
+        consumers use to reach the cluster. Hadoop-native clients that
+        prefer connecting by hostname can set
+        dfs.client.use.datanode.hostname=true in their own core-site.xml;
+        clients that hardcode ip_addr (opendal/hdfs-native) are served
+        by the rpc-address fix above instead.
     -->
     <property><name>dfs.datanode.hostname</name><value>__HDFS_HOSTNAME__</value></property>
     <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>

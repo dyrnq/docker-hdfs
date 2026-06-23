@@ -2,7 +2,15 @@
 <configuration>
     <property><name>dfs.replication</name><value>1</value></property>
 
-    <property><name>dfs.namenode.rpc-address</name><value>0.0.0.0:8020</value></property>
+    <!-- rpc-address = hostname:port (not 0.0.0.0) so the DataNode
+         connects to the NameNode over its real interface and the NN
+         records the real ip_addr (see rootfs hdfs-site.xml comment +
+         GitHub issue #8). rpc-bind-host=0.0.0.0 keeps the NN listening
+         on all interfaces. The simple-mode smoke test runs the
+         container with hostname hdfs.test, which resolves to the
+         container IP. -->
+    <property><name>dfs.namenode.rpc-address</name><value>hdfs.test:8020</value></property>
+    <property><name>dfs.namenode.rpc-bind-host</name><value>0.0.0.0</value></property>
     <property><name>dfs.namenode.https-address</name><value>0.0.0.0:9871</value></property>
 
     <property><name>dfs.datanode.address</name><value>0.0.0.0:9866</value></property>
