@@ -7,6 +7,80 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------
+  # Lint: cheap pre-flight on the envtoxml Rust source. ~5s on a warm
+  # runner, so it's free to run before every push. Catches:
+  #   - rustfmt drift (`cargo fmt --check`) — the multi-stage Docker
+  #     build compiles envtoxml but does NOT check formatting, so a
+  #     regressed file would otherwise reach the smoke matrix and only
+  #     fail downstream reviews.
+  #   - test regressions (`cargo test`) — runs the same 17 integration
+  #     tests the developer runs locally, but in CI so a broken merge
+  #     can't slip past review.
+  #   - cross-arch release builds — `cargo build --target x86_64...musl`
+  #     natively + `cross build --target aarch64...musl` via Docker.
+  #     The smoke matrix also builds both arches (one per native
+  #     runner), but that's behind a full docker build + s6 bringup;
+  #     this lint catches arch-specific Cargo.lock / dep issues in
+  #     seconds without leaving the Rust toolchain. The Dockerfile
+  #     builder stage matches these targets (rustup target add + cargo
+  #     build --release --target …) — if these lint builds pass, the
+  #     builder's `cargo build` will too.
+  # Gating `smoke` on `lint` keeps the slow multi-arch build+docker
+  # run off the critical path when the source has obvious problems.
+  # Toolchain pinned to 1.83 to match the Dockerfile builder stage
+  # (rust:1.83-slim-bookworm); bump both together.
+  # ---------------------------------------------------------------------
+  lint:
+    name: envtoxml fmt + tests + cross-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache ~/.cargo + tools/envtoxml/target across runs. Swatinem's
+      # cache key is content-aware (Cargo.lock hash, source hash) so
+      # unrelated commits still hit warm cache for unchanged deps.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/envtoxml -> target
+
+      - name: Install Rust 1.83 + both musl targets
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.83
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      # amd64 musl build: native `cargo build` on the host, only needs
+      # musl-tools for the cross-linker (musl-gcc). The arm64 build
+      # below uses `cross`, which brings its own cross-toolchain via
+      # Docker — no host musl-gcc variant for aarch64 is needed.
+      - name: Install musl-tools (amd64 musl linker)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      # `cross` is the official cross-rs wrapper — pulls a pre-built
+      # Docker image with the right cross-toolchain for the target.
+      # First run is ~3-5 min (cargo install + image pull); subsequent
+      # runs hit Swatinem's cargo cache and skip the install.
+      - name: Install cross (arm64 cross-builder via Docker)
+        run: cargo install cross --locked
+
+      - name: cargo fmt --check
+        working-directory: tools/envtoxml
+        run: cargo fmt --check
+
+      - name: cargo test (amd64 native, glibc target)
+        working-directory: tools/envtoxml
+        run: cargo test
+
+      - name: cargo build (amd64 musl, release)
+        working-directory: tools/envtoxml
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: cross build (arm64 musl, release)
+        working-directory: tools/envtoxml
+        run: cross build --release --target aarch64-unknown-linux-musl
+
+  # ---------------------------------------------------------------------
   # Smoke tests: 2 distros × 2 native arches, run in parallel.
   #
   # Each matrix entry uses a runner whose CPU matches the target arch
@@ -24,6 +98,7 @@ jobs:
   # ---------------------------------------------------------------------
   smoke:
     name: smoke (${{ matrix.arch }}, ${{ matrix.variant }})
+    needs: lint
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
