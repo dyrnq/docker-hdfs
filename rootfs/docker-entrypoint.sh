@@ -499,6 +499,20 @@ case "${HADOOP_SECURITY_AUTHENTICATION}" in
 esac
 
 for f in hdfs-site.xml core-site.xml; do
+    # Skip operator-mounted XMLs entirely. The entrypoint's
+    # contract for bind-mounted files is "the operator's file IS
+    # the rendered file" — no heredoc, no sed, no cp-back. The
+    # is_xml_overridden check (mountpoint -q + [ ! -w ]) catches
+    # both :ro and :rw bind-mounts. Putting the check at the top
+    # of the loop (instead of after the heredoc+sed pass) avoids
+    # ~0.01s × 2 files of wasted work per container start, and —
+    # more importantly — keeps the "do nothing for operator files"
+    # contract visible at the top of the loop body (issue 5).
+    if is_xml_overridden "${HADOOP_ETC}/${f}"; then
+        echo "=== ${HADOOP_ETC}/${f} is bind-mounted or read-only (operator override); skipping heredoc render ==="
+        continue
+    fi
+
     # Source the base XML from the bash heredoc functions defined
     # further down in this file (hdfs_site_xml / core_site_xml).
     # The XMLs are NOT in the image's rootfs tree — the upstream
@@ -555,6 +569,15 @@ is_xml_overridden() {
 for f in hdfs-site.xml core-site.xml; do
     if is_xml_overridden "${HADOOP_ETC}/${f}"; then
         echo "=== ${HADOOP_ETC}/${f} is bind-mounted or read-only (operator override); using source as-is ==="
+        continue
+    fi
+    # The heredoc render above may have been skipped if the path
+    # became a mount between the two checks (race; rare). Belt-
+    # and-suspenders: skip the cp-back too if there's nothing
+    # to copy. Without this, `cp -f` would error out on a missing
+    # source and the container would FATAL on startup.
+    if [ ! -f "${TMPDIR_ENT}/${f}" ]; then
+        echo "=== ${HADOOP_ETC}/${f}: no rendered XML to copy (heredoc render skipped) ==="
         continue
     fi
     cp -f "${TMPDIR_ENT}/${f}" "${HADOOP_ETC}/${f}"
