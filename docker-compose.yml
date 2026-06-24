@@ -18,10 +18,10 @@ services:
     hostname: ${HDFS_HOSTNAME:-hdfs.test}
     ports:
       - "8020:8020"   # NameNode RPC
-      - "9870:9870"   # NameNode Web UI (HTTP redirect to HTTPS)
-      - "9871:9871"   # NameNode HTTPS
+      - "9870:9870"   # NameNode Web UI (HTTP; default dfs.http.policy=HTTP_ONLY)
+      - "9871:9871"   # NameNode HTTPS (only under HTTPS_ONLY / HTTP_AND_HTTPS)
       - "9864:9864"   # DataNode HTTP
-      - "9865:9865"   # DataNode HTTPS
+      - "9865:9865"   # DataNode HTTPS (only under HTTPS_ONLY / HTTP_AND_HTTPS)
       - "9866:9866"   # DataNode IPC
       - "88:88"       # KDC
       - "464:464"     # kpasswd
@@ -32,6 +32,14 @@ services:
       KRB5_KDC: ${KRB5_KDC:-hdfs.test}
       KRB5_DOMAIN: ${KRB5_DOMAIN:-test}
       HDFS_NAMENODE_RPC_PORT: 8020
+      # Override HDFS_SERVICES to run a subset of the four s6
+      # longruns — e.g. "namenode,datanode" (no KDC, for dev),
+      # "krb5kdc,kadmind" (KDC only, for keytab distribution to
+      # other pods), or "datanode" + HDFS_NAMENODE_HOST=<remote-nn>
+      # (DN only, pointing at a remote NN). See the README
+      # "Service layout (HDFS_SERVICES)" section for the four
+      # recommended shapes and the multi-container trade-offs.
+      HDFS_SERVICES: ${HDFS_SERVICES:-namenode,datanode,krb5kdc,kadmind}
     volumes:
       - hdfs-data-debian:/var/lib/hadoop
       - hdfs-kdc-debian:/var/lib/krb5kdc
@@ -63,6 +71,7 @@ services:
       KRB5_KDC: ${KRB5_KDC:-hdfs.test}
       KRB5_DOMAIN: ${KRB5_DOMAIN:-test}
       HDFS_NAMENODE_RPC_PORT: 8020
+      HDFS_SERVICES: ${HDFS_SERVICES:-namenode,datanode,krb5kdc,kadmind}
     volumes:
       - hdfs-data-ubuntu:/var/lib/hadoop
       - hdfs-kdc-ubuntu:/var/lib/krb5kdc

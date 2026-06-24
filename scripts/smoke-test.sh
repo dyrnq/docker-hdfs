@@ -37,8 +37,56 @@
 #   ./scripts/smoke-test.sh                          # kerberos (default)
 #   ./scripts/smoke-test.sh kerberos
 #   ./scripts/smoke-test.sh simple
+#   ./scripts/smoke-test.sh kdc-only
+#   ./scripts/smoke-test.sh datanode-only
 #   MODE=simple ./scripts/smoke-test.sh
 #   IMAGE=dyrnq/hdfs:latest-ubuntu ./scripts/smoke-test.sh
+#
+# Modes:
+#   kerberos  — HDFS_SERVICES=namenode,datanode,krb5kdc,kadmind (default).
+#               Full cluster with KDC; the canonical deployment.
+#   simple    — HADOOP_SECURITY_AUTHENTICATION=simple, which the
+#               entrypoint translates to HDFS_SERVICES=namenode,datanode.
+#               No KDC, no keytab; the entrypoint auto-strips the
+#               kerberos XML properties.
+#   kdc-only  — HDFS_SERVICES=krb5kdc,kadmind. Only the KDC comes up;
+#               no NN, no DN. Exercises the HDFS_SERVICES isolation
+#               path in the entrypoint — proves a container can run
+#               JUST the KDC for keytab distribution to other pods,
+#               even though namenode/datanode longruns are not started.
+#   datanode-only — HDFS_SERVICES=datanode (no namenode, no KDC). The
+#               entrypoint MUST NOT FATAL on this; s6-rc-compile must
+#               accept it (the dynamic dep build creates no edges
+#               since namenode is missing); the DN run script's
+#               hdfs_wait_for_namenode is expected to time out (no NN
+#               to talk to) and s6 will mark the service down. The
+#               test passes as long as the container itself stays up
+#               long enough for s6 to mark the service down — i.e.
+#               the entrypoint did not block startup.
+#   mount-ro   — bind-mount a host XML at :ro + pass envtoxml env
+#               vars. The entrypoint must (a) NOT clobber the
+#               operator's XML (cp-back skipped), (b) NOT merge env
+#               vars into it (envtoxml skipped). Asserts both by
+#               comparing container's XML byte-for-byte to the host
+#               file and verifying env vars did NOT land.
+#   mount-rw   — same as mount-ro but :rw. Regression test for the
+#               previous `[ ! -w ]`-only guard bug (which let the
+#               entrypoint clobber operator XMLs on :rw mounts). The
+#               new `is_xml_overridden()` catches both via
+#               `mountpoint -q`. Verifies the operator's XML survives.
+#   disable-envtoxml — HDFS_DISABLE_ENVTOXML=1. The entrypoint must
+#               render the heredoc + apply sed placeholder substitution
+#               but skip envtoxml entirely. Env vars must NOT land.
+#               Also verifies the entrypoint's loud WARN about the
+#               simple-mode interaction (auto-strip is implemented
+#               inside envtoxml, so disabling it in simple mode
+#               leaves kerberos-only properties in the XML).
+#   empty     — HDFS_SERVICES= (explicit empty). The entrypoint must
+#               accept this layout (no FATAL), s6-rc-compile must
+#               accept an empty user bundle, and the container must
+#               stay up indefinitely. Verifies no longruns start
+#               (no ports bound) and the entrypoint log shows the
+#               empty value (not a substituted default).
 set -euo pipefail
 
 # Args: <mode> [image]
@@ -47,8 +95,8 @@ set -euo pipefail
 # then to the debian default.
 MODE="${1:-${MODE:-kerberos}}"
 case "${MODE}" in
-    kerberos|simple) ;;
-    *) echo "FAIL: unknown mode '${MODE}' (want: kerberos|simple)"; exit 2 ;;
+    kerberos|simple|kdc-only|datanode-only|mount-ro|mount-rw|disable-envtoxml|empty) ;;
+    *) echo "FAIL: unknown mode '${MODE}' (want: kerberos|simple|kdc-only|datanode-only|mount-ro|mount-rw|disable-envtoxml|empty)"; exit 2 ;;
 esac
 shift || true
 IMAGE="${1:-${IMAGE:-dyrnq/hdfs:latest-debian}}"
@@ -57,10 +105,16 @@ REALM="${KRB5_REALM:-TEST.LOCAL}"
 NET="hdfs-smoke-net-$$"
 SERVER="hdfs-smoke-$$"
 KRB5_PASS=""
+# mount-ro / mount-rw create a host tmpdir with a sentinel XML;
+# tracked here so cleanup() removes it on exit.
+SMOKE_TMPDIR=""
 
 cleanup() {
     docker rm -f "$SERVER" 2>/dev/null || true
     docker network rm "$NET" 2>/dev/null || true
+    if [ -n "${SMOKE_TMPDIR}" ] && [ -d "${SMOKE_TMPDIR}" ]; then
+        rm -rf "${SMOKE_TMPDIR}"
+    fi
 }
 trap cleanup EXIT
 
@@ -99,6 +153,170 @@ if [ "$MODE" = "kerberos" ]; then
         -e "HDFS-SITE.XML_dfs.replication=2" \
         -e "HDFS-SITE.XML_dfs.namenode.secondary.http-address=!remove" \
         "$IMAGE"
+elif [ "$MODE" = "kdc-only" ]; then
+    # KDC-only launch: pin HDFS_SERVICES to krb5kdc,kadmind and let
+    # HADOOP_SECURITY_AUTHENTICATION default to kerberos. The
+    # entrypoint's HDFS_SERVICES block (1) rebuilds contents.d/ so
+    # the s6 longruns for namenode + datanode are NEVER started and
+    # (2) cleans up the dangling `namenode→krb5kdc` and `datanode→
+    # namenode` edges (no NN = nothing for DN to depend on, no KDC-
+    # free mode = no KDC for NN to wait for). The KDC bootstrap
+    # still runs because HADOOP_SECURITY_AUTHENTICATION=kerberos
+    # gates that block separately. The point of this mode is to
+    # prove the isolation: a single container that boots ONLY a
+    # KDC, so other pods in the deployment can kinit against it
+    # for keytab distribution. We pass no Hadoop-related env vars
+    # — the test relies on the entrypoint's defaults for the
+    # realm/hostname/ports.
+    echo "=== Starting container (kdc-only: HDFS_SERVICES=krb5kdc,kadmind) ==="
+    docker run -d --name "$SERVER" \
+        --network "$NET" \
+        --hostname "$HOST" \
+        -e HDFS_HOSTNAME="$HOST" \
+        -e HDFS_SERVICES=krb5kdc,kadmind \
+        "$IMAGE"
+elif [ "$MODE" = "datanode-only" ]; then
+    # Single-service start: HDFS_SERVICES=datanode, with simple
+    # auth so the DN's kinit is skipped. The point of this mode
+    # is to prove the entrypoint does NOT FATAL on a partial
+    # layout (no namenode, no KDC) and that s6-rc-compile
+    # accepts the dep graph (no edges get created because the
+    # targets — namenode, krb5kdc — are missing). The DN run
+    # script will then time out on hdfs_wait_for_namenode (no
+    # NN to register with); we don't try to make the DN happy,
+    # we just verify the entrypoint + s6-rc-compile path. The
+    # container stays up; the DN service is marked down by s6.
+    echo "=== Starting container (datanode-only: HDFS_SERVICES=datanode) ==="
+    docker run -d --name "$SERVER" \
+        --network "$NET" \
+        --hostname "$HOST" \
+        -e HDFS_HOSTNAME="$HOST" \
+        -e HDFS_SERVICES=datanode \
+        -e HADOOP_SECURITY_AUTHENTICATION=simple \
+        "$IMAGE"
+elif [ "$MODE" = "mount-ro" ]; then
+    # Mount-A: operator binds their own hdfs-site.xml :ro. The
+    # entrypoint must (a) NOT clobber the operator's file (cp-back
+    # skipped via is_xml_overridden), (b) NOT merge envtoxml env
+    # vars into it. We prove both by checking byte-identity with
+    # the host file AND checking that an env var with a sentinel
+    # value did NOT land.
+    #
+    # The host XML is intentionally small + atypical (no
+    # kerberos, no bind-host fixes). If the entrypoint clobbered
+    # it, the heredoc's 25+ properties would suddenly appear and
+    # the byte-identity check would fail.
+    #
+    # HADOOP_SECURITY_AUTHENTICATION=simple keeps the test
+    # hermetic — no KDC, no SASL, no keytab generation.
+    echo "=== Starting container (mount-ro: bind-mount hdfs-site.xml:ro + envtoxml env vars) ==="
+    SMOKE_TMPDIR=$(mktemp -d)
+    cat > "${SMOKE_TMPDIR}/hdfs-site.xml" <<'EOF'
+<?xml version="1.0"?>
+<configuration>
+    <property><name>dfs.replication</name><value>7</value></property>
+    <property><name>dfs.namenode.rpc-address</name><value>my-nn.example.com:8020</value></property>
+    <property><name>smoke.test.marker</name><value>HOST_FILE_RO</value></property>
+</configuration>
+EOF
+    docker run -d --name "$SERVER" \
+        --network "$NET" \
+        --hostname "$HOST" \
+        -e HDFS_HOSTNAME="$HOST" \
+        -e HADOOP_SECURITY_AUTHENTICATION=simple \
+        -v "${SMOKE_TMPDIR}/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro" \
+        -e "HDFS-SITE.XML_dfs.replication=999" \
+        -e "HDFS-SITE.XML_smoke.test.envvar=SHOULD_NOT_LAND" \
+        "$IMAGE"
+elif [ "$MODE" = "mount-rw" ]; then
+    # Mount-B: same as mount-ro but :rw. Regression test for the
+    # previous `[ ! -w ]`-only guard bug, which let the
+    # entrypoint's `cp -f` clobber operator XMLs on :rw mounts
+    # (`:rw` IS writable so `[ ! -w ]` returned 1 = "not
+    # overridden", and the heredoc render got written over the
+    # operator's file). The fix is `is_xml_overridden()` checking
+    # `mountpoint -q` first, which catches bind-mounts regardless
+    # of writability. This mode proves the fix.
+    #
+    # Critical: the verification checks that the host file's
+    # CONTENT survived — i.e. `dfs.replication=7` (host) not =1
+    # (heredoc). If the entrypoint clobbered, the byte-identity
+    # check would fail (heredoc has 25+ props; host has 3).
+    echo "=== Starting container (mount-rw: bind-mount hdfs-site.xml:rw + envtoxml env vars) ==="
+    SMOKE_TMPDIR=$(mktemp -d)
+    cat > "${SMOKE_TMPDIR}/hdfs-site.xml" <<'EOF'
+<?xml version="1.0"?>
+<configuration>
+    <property><name>dfs.replication</name><value>7</value></property>
+    <property><name>smoke.test.marker</name><value>HOST_FILE_RW</value></property>
+</configuration>
+EOF
+    docker run -d --name "$SERVER" \
+        --network "$NET" \
+        --hostname "$HOST" \
+        -e HDFS_HOSTNAME="$HOST" \
+        -e HADOOP_SECURITY_AUTHENTICATION=simple \
+        -v "${SMOKE_TMPDIR}/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw" \
+        -e "HDFS-SITE.XML_dfs.replication=999" \
+        "$IMAGE"
+elif [ "$MODE" = "disable-envtoxml" ]; then
+    # Mount-C: HDFS_DISABLE_ENVTOXML=1. The entrypoint must render
+    # the heredoc + apply sed placeholder substitution, but skip
+    # the envtoxml pass entirely. Env vars must NOT land.
+    #
+    # Side effect to be aware of: HADOOP_SECURITY_AUTHENTICATION=
+    # simple means the entrypoint WOULD auto-strip the kerberos
+    # properties via envtoxml. Disabling envtoxml in simple mode
+    # leaves them in place, which is a known interaction (issues
+    # #13/#14 design). The entrypoint prints a loud WARN for this
+    # combination; we assert that WARN is logged. The kerberos-
+    # only properties staying in the XML is expected behavior,
+    # NOT a failure — the test only requires the env vars NOT
+    # land and the WARN to be present.
+    #
+    # Note: no hdfs dfs round-trip in this mode — the NN/DN would
+    # fail to start (kinit has nowhere to go), and that's the
+    # expected outcome. We just verify the entrypoint + XML
+    # rendering branches, then exit.
+    echo "=== Starting container (disable-envtoxml: HDFS_DISABLE_ENVTOXML=1) ==="
+    docker run -d --name "$SERVER" \
+        --network "$NET" \
+        --hostname "$HOST" \
+        -e HDFS_HOSTNAME="$HOST" \
+        -e HADOOP_SECURITY_AUTHENTICATION=simple \
+        -e HDFS_DISABLE_ENVTOXML=1 \
+        -e "HDFS-SITE.XML_dfs.replication=999" \
+        -e "HDFS-SITE.XML_smoke.test.envvar=SHOULD_NOT_LAND" \
+        "$IMAGE"
+elif [ "$MODE" = "empty" ]; then
+    # Layout-A: HDFS_SERVICES= (explicit empty value). The
+    # entrypoint must accept this without falling back to a
+    # default — `: ${HDFS_SERVICES:=default}` substitutes on
+    # empty values, so the old line at entrypoint:331 had to be
+    # removed (the empty-profile support task #115). The
+    # remaining `${VAR+set}` probe in the env-to-default block
+    # handles "unset" correctly without clobbering "set to empty".
+    #
+    # Outcomes to verify:
+    #   - container stays up (entrypoint didn't FATAL on empty)
+    #   - s6-rc bundle has zero user services (4 services absent)
+    #   - no longruns → no ports bound (88/464/8020/9870/9866/9864
+    #     all unbound per /proc/net/tcp[6])
+    #   - entrypoint log shows the literal empty value, NOT a
+    #     substituted default
+    #
+    # Default HADOOP_SECURITY_AUTHENTICATION=kerberos means the
+    # KDC bootstrap block still runs (gated on auth, not on
+    # HDFS_SERVICES) and writes the realm DB + keytab to the
+    # volume — that's expected, useful for the "bootstrap a KDC
+    # volume, mount into another container" use case.
+    echo "=== Starting container (empty: HDFS_SERVICES=) ==="
+    docker run -d --name "$SERVER" \
+        --network "$NET" \
+        --hostname "$HOST" \
+        -e HDFS_HOSTNAME="$HOST" \
+        -e HDFS_SERVICES= \
+        "$IMAGE"
 else
     # Simple auth launch: run the normal entrypoint but pass
     # HADOOP_SECURITY_AUTHENTICATION=simple so the entrypoint
@@ -118,26 +336,29 @@ else
     # can copy into a deployment. envtoxml's [ -w ] guard runs
     # because we don't bind-mount the XMLs, so the merges are
     # actually applied to /opt/hadoop/etc/hadoop/*.xml.
-    echo "=== Starting container (simple, env-driven) ==="
+    #
+    # The entrypoint's simple-mode branch auto-strips the kerberos
+    # properties from hdfs-site.xml / core-site.xml (issues #13, #14)
+    # — so we no longer need to pass the 11 `HDFS-SITE.XML_*` /
+    # `CORE-SITE.XML_*` env vars. The smoke now exercises the
+    # entrypoint path with a single env var
+    # (HADOOP_SECURITY_AUTHENTICATION=simple), which is the
+    # intended user-facing UX.
+    echo "=== Starting container (simple, entrypoint auto-strip) ==="
     docker run -d --name "$SERVER" \
         --network "$NET" \
         --hostname "$HOST" \
         -e HDFS_HOSTNAME="$HOST" \
         -e HADOOP_SECURITY_AUTHENTICATION=simple \
-        -e "HDFS-SITE.XML_dfs.namenode.kerberos.principal=!remove" \
-        -e "HDFS-SITE.XML_dfs.namenode.keytab.file=!remove" \
-        -e "HDFS-SITE.XML_dfs.datanode.kerberos.principal=!remove" \
-        -e "HDFS-SITE.XML_dfs.datanode.keytab.file=!remove" \
-        -e "HDFS-SITE.XML_dfs.web.authentication.kerberos.principal=!remove" \
-        -e "HDFS-SITE.XML_dfs.web.authentication.kerberos.keytab=!remove" \
-        -e "HDFS-SITE.XML_dfs.data.transfer.protection=!remove" \
-        -e "HDFS-SITE.XML_dfs.block.access.token.enable=false" \
-        -e "CORE-SITE.XML_hadoop.rpc.protection=!remove" \
-        -e "CORE-SITE.XML_hadoop.security.authorization=false" \
         "$IMAGE"
 fi
 
-if [ "$MODE" = "kerberos" ]; then
+# The KDC + KRB5_PASS path is shared by the kerberos and kdc-only modes
+# (both run with HADOOP_SECURITY_AUTHENTICATION=kerberos, so the
+# KDC bootstrap path runs in the entrypoint and the .krb5_pass file
+# is written). In simple mode the KDC never comes up and the file
+# does not exist, so this whole block is skipped.
+if [ "$MODE" = "kerberos" ] || [ "$MODE" = "kdc-only" ]; then
     echo "=== Waiting for KDC (port 88) ==="
     for i in $(seq 1 60); do
         if docker exec "$SERVER" nc -z localhost 88 2>/dev/null; then
@@ -171,6 +392,625 @@ if [ "$MODE" = "kerberos" ]; then
         exit 1
     fi
     echo "  KRB5_PASS length: ${#KRB5_PASS}"
+fi
+
+# ---------------------------------------------------------------------
+# kdc-only mode short-circuits the rest of the script. The point of
+# the mode is to prove HDFS_SERVICES isolation: a container that
+# boots ONLY the KDC, with no NN/DN. Everything below this point is
+# full-cluster verification (NN RPC, DN registration, dfsadmin, file
+# round-trip) which is meaningless without a NameNode. We verify
+# the three properties the mode is designed to exercise, then exit
+# cleanly so the full-cluster assertions (which would otherwise
+# time out waiting for an NN that was never started) don't fire.
+# ---------------------------------------------------------------------
+if [ "$MODE" = "kdc-only" ]; then
+    echo "=== kdc-only verification (HDFS_SERVICES isolation) ==="
+
+    # Authoritative state signal: `s6-rc -a list` enumerates the
+    # services s6-rc currently knows about, which is exactly the
+    # union of contents.d/ in the user bundle + the s6-overlay
+    # internal services (s6rc-oneshot-runner, fix-attrs,
+    # legacy-cont-init, legacy-services). Services the entrypoint
+    # removed from contents.d/ (via the HDFS_SERVICES block) do
+    # NOT appear here, even though their on-disk servicedirs at
+    # /run/s6-rc/servicedirs/<name> still exist (s6-rc-compile
+    # creates servicedirs for every compiled service, but only
+    # those in the user bundle get symlinked at /run/service/<n>
+    # AND brought up). /run/service/<n> is therefore NOT a reliable
+    # signal of bundle membership — we have to ask s6-rc.
+    #
+    # s6-rc is at /command/s6-rc (s6-overlay 3.x doesn't put it on
+    # PATH for `docker exec` shells; PATH is /opt/hadoop/bin:...:/bin
+    # and s6 lives at /command/, only added by with-contenv).
+    s6_bundle() {
+        docker exec "$SERVER" /command/s6-rc -a list 2>/dev/null
+    }
+
+    BUNDLE=$(s6_bundle)
+    if [ -z "$BUNDLE" ]; then
+        echo "FAIL: 's6-rc -a list' returned no output; cannot verify isolation"
+        docker logs "$SERVER"
+        exit 1
+    fi
+
+    # (1) krb5kdc + kadmind must be in the user bundle. s6
+    # internally tracks up/down state for started services via
+    # s6-svstat (also at /command/), so we cross-check by
+    # confirming no java/hadoop process is bound to the NN/DN
+    # ports either.
+    for svc in krb5kdc kadmind; do
+        if ! echo "$BUNDLE" | grep -qx "$svc"; then
+            echo "FAIL: kdc-only mode but '${svc}' is not in s6-rc bundle"
+            echo "  bundle:"; echo "$BUNDLE" | sed 's/^/    /'
+            exit 1
+        fi
+    done
+    echo "  krb5kdc + kadmind: in s6-rc bundle"
+
+    # (2) namenode + datanode must NOT be in the bundle. If
+    # either shows up, the entrypoint's contents.d/ rebuild is
+    # broken and the isolation regressed to "all 4 services" —
+    # the worst-case failure mode (HDFS_SERVICES silently
+    # ignored, the KDC runs alone AND an NN/DN also start).
+    for svc in namenode datanode; do
+        if echo "$BUNDLE" | grep -qx "$svc"; then
+            echo "FAIL: kdc-only mode but '${svc}' IS in s6-rc bundle"
+            echo "  HDFS_SERVICES isolation broken; bundle:"
+            echo "$BUNDLE" | sed 's/^/    /'
+            exit 1
+        fi
+    done
+    echo "  namenode + datanode: not in s6-rc bundle (HDFS_SERVICES isolation ok)"
+
+    # (3) Cross-check: no NameNode / DataNode processes. This
+    # catches the case where the bundle is wrong but somehow
+    # an NN got started out-of-band, OR the s6-svstat state
+    # for a removed service is "up" because of a stale symlink.
+    # The grep is broad on purpose (the run script invokes
+    # `hdfs namenode` / `hdfs datanode` and the JVM class
+    # names NameNode / DataNode both appear in `ps` output).
+    PIDS=$(docker exec "$SERVER" sh -c \
+        'ps -ef 2>/dev/null | grep -E "(org\.apache\.hadoop\.hdfs\.server\.(namenode|NameNode|datanode|DataNode)\.|hdfs (namenode|datanode))" | grep -v grep || true' 2>/dev/null)
+    if [ -n "$PIDS" ]; then
+        echo "FAIL: kdc-only mode but NameNode/DataNode process found"
+        echo "$PIDS" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  ps: no NameNode/DataNode processes"
+
+    # (4) kinit testuser against the embedded KDC — proves the
+    # KDC services not only started but actually answer AS
+    # requests and will hand out a TGT. This is the meat of the
+    # "KDC for keytab distribution" use case: an external pod
+    # running kinit with `-t <keytab>` and a -c cache would
+    # follow the same code path.
+    KRB5_TESTUSER_PASS="${KRB5_TESTUSER_PASS:-testpass}"
+    docker exec "$SERVER" bash -c "
+        set -e
+        printf '%s\n' \"\${KRB5_TESTUSER_PASS:-testpass}\" | kinit testuser@${REALM}
+        klist
+    "
+    echo "  kinit testuser: TGT issued by embedded KDC"
+
+    # (5) Negative check: hdfs dfs against the would-be NN RPC
+    # port must fail. There is no NN, so dfs should error out
+    # with a connection refused (or similar), NOT silently succeed
+    # with a stale cluster. A 0 exit here means a DN/NN somehow
+    # came up despite HDFS_SERVICES — i.e. the isolation regressed
+    # to "all 4 services". Catching this is the whole point of
+    # the mode.
+    if docker exec "$SERVER" gosu hdfs /opt/hadoop/bin/hdfs \
+        dfs -fs "hdfs://${HOST}:8020" -ls / 2>/dev/null; then
+        echo "FAIL: kdc-only mode but hdfs dfs succeeded (NN should be down)"
+        exit 1
+    fi
+    echo "  hdfs dfs: failed as expected (no NN running)"
+
+    echo "=== SMOKE TEST PASSED (mode=${MODE}) ==="
+    exit 0
+fi
+
+# ---------------------------------------------------------------------
+# datanode-only mode short-circuits the rest of the script. The point
+# of this mode is to prove the entrypoint's dynamic dep build accepts
+# a partial layout (just datanode) without FATAL and that s6-rc-compile
+# succeeds even with no namenode, no krb5kdc in the bundle. The DN
+# longrun will then time out on hdfs_wait_for_namenode (no NN to talk
+# to) and s6 will mark the service down — that's expected. We verify
+# the four properties the mode is designed to exercise, then exit
+# cleanly. The full-cluster assertions below (NN wait, dfsadmin,
+# put/cat) would otherwise time out since there is no NN.
+# ---------------------------------------------------------------------
+if [ "$MODE" = "datanode-only" ]; then
+    echo "=== datanode-only verification (dynamic dep build) ==="
+
+    # Give the container a moment to settle: s6-rc-compile runs in
+    # /init AFTER the entrypoint returns, and the DN longrun starts
+    # only after that. If the entrypoint FATAL'd (e.g. on the
+    # dynamic dep build), the container exits before s6 even
+    # compiles the bundle. 10s is enough for s6-rc-compile to
+    # finish on a 1-service bundle and for the DN longrun to start
+    # and reach its first hdfs_wait_for_namenode call.
+    sleep 10
+
+    # (1) The container must still be RUNNING. If the entrypoint
+    # crashed, the container exits and `docker ps` shows nothing.
+    # This is the most fundamental assertion: the entrypoint did
+    # not FATAL on a partial HDFS_SERVICES layout.
+    if ! docker ps --format '{{.Names}}' | grep -qx "$SERVER"; then
+        echo "FAIL: datanode-only mode but container is not running"
+        echo "  (entrypoint FATAL'd on partial HDFS_SERVICES layout?)"
+        docker logs "$SERVER" 2>/dev/null || true
+        exit 1
+    fi
+    echo "  container: still running (entrypoint did not FATAL)"
+
+    # (2) s6-rc bundle must contain only datanode among the 4
+    # Hadoop services. krb5kdc + kadmind + namenode are absent.
+    s6_bundle() {
+        docker exec "$SERVER" /command/s6-rc -a list 2>/dev/null
+    }
+    BUNDLE=$(s6_bundle)
+    if [ -z "$BUNDLE" ]; then
+        echo "FAIL: 's6-rc -a list' returned no output"
+        docker logs "$SERVER"
+        exit 1
+    fi
+    if ! echo "$BUNDLE" | grep -qx "datanode"; then
+        echo "FAIL: datanode-only mode but 'datanode' is not in s6-rc bundle"
+        echo "  bundle:"; echo "$BUNDLE" | sed 's/^/    /'
+        exit 1
+    fi
+    for svc in krb5kdc kadmind namenode; do
+        if echo "$BUNDLE" | grep -qx "$svc"; then
+            echo "FAIL: datanode-only mode but '${svc}' IS in s6-rc bundle"
+            echo "  HDFS_SERVICES isolation broken; bundle:"
+            echo "$BUNDLE" | sed 's/^/    /'
+            exit 1
+        fi
+    done
+    echo "  bundle: only datanode (krb5kdc + kadmind + namenode absent)"
+
+    # (3) No NameNode / KDC / kadmind longrun is actually
+    # RUNNING. Cross-check (2) — even though krb5kdc + kadmind
+    # + namenode are not in the user bundle, s6-rc-compile still
+    # creates servicedirs for them (compile keys off servicedir
+    # existence, not bundle membership), and s6-svscan leaves
+    # an `s6-supervise <name>` daemon attached to each
+    # servicedir. So `ps -ef | grep s6-supervise` will list
+    # krb5kdc + kadmind + namenode — that's normal and NOT a
+    # sign those services are running. The reliable signal is
+    # s6-svstat's "up" state, which goes "up" only AFTER the
+    # service's run script forks the daemon. (s6-svstat
+    # appears in the grep below as "s6-svstat" — we exclude
+    # it explicitly.)
+    #
+    # s6-svstat output format: "up (pid N pgid M) Ts" or
+    # "down (exitcode 0) Ts, ready Ts" or similar. We use awk
+    # to extract just the first word.
+    for svc in krb5kdc kadmind namenode; do
+        state=$(docker exec "$SERVER" /command/s6-svstat "/run/service/${svc}" 2>/dev/null \
+            | awk '{print $1; exit}' || true)
+        if [ "$state" = "up" ]; then
+            echo "FAIL: datanode-only mode but '${svc}' longrun is up"
+            docker exec "$SERVER" /command/s6-svstat "/run/service/${svc}" 2>&1 | sed 's/^/    /'
+            docker logs "$SERVER"
+            exit 1
+        fi
+    done
+    echo "  s6-svstat: krb5kdc + kadmind + namenode all down (longruns did NOT start)"
+
+    # (4) Nothing is bound on the KDC (88) or kadmind (464)
+    # ports. A second cross-check for (3) — even if s6-svstat
+    # missed something, the kernel's port table is the
+    # authoritative answer for "is anything answering?". We
+    # use /proc/net/tcp[6] like the IPv4 listener check below,
+    # since `nc -z` from busybox is unreliable (it can exit 0
+    # for unbound ports on some configurations).
+    PROC_TCP=$(docker exec "$SERVER" cat /proc/net/tcp 2>/dev/null || true)
+    PROC_TCP6=$(docker exec "$SERVER" cat /proc/net/tcp6 2>/dev/null || true)
+    FAIL_PORT=0
+    for port in 88 464; do
+        port_hex=$(printf '%04X' "$port")
+        # IPv4 LISTEN (st=0A) on this port anywhere.
+        v4=$(echo "$PROC_TCP" | awk -v p=":$port_hex" \
+            '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
+        # IPv6 LISTEN, excluding the pure IPv6 wildcard.
+        v6=$(echo "$PROC_TCP6" | awk -v p=":$port_hex" \
+            '$2 ~ p"$" && $4 == "0A" && $2 !~ /^00000000000000000000000000000000:/ {print $2; exit}')
+        if [ -n "$v4" ] || [ -n "$v6" ]; then
+            echo "FAIL: port $port (0x$port_hex) has a LISTEN — KDC/kadmind should be down"
+            FAIL_PORT=1
+        fi
+    done
+    if [ "$FAIL_PORT" = "1" ]; then
+        docker logs "$SERVER"
+        exit 1
+    fi
+    echo "  ports: 88 (KDC) and 464 (kadmind) unbound"
+
+    # (5) The datanode service is registered with s6-rc (proving
+    # s6-rc-compile accepted the dep graph with no edges — the
+    # entrypoint's dynamic dep build created no files in
+    # datanode/dependencies.d/ because namenode was absent).
+    # s6-svstat reports "up" for the DN because the run script
+    # has entered hdfs_wait_for_namenode and is currently
+    # polling hdfs dfsadmin (the DFSAdmin JVM visible in
+    # `ps -ef`); the script as a whole is "up" from s6's
+    # perspective. That's the EXPECTED state for a
+    # datanode-only container — not a failure.
+    DN_STATE=$(docker exec "$SERVER" /command/s6-svstat /run/service/datanode 2>/dev/null \
+        | awk '{print $1; exit}' || true)
+    if [ "$DN_STATE" != "up" ]; then
+        echo "FAIL: datanode service is not 'up' (got '${DN_STATE:-unknown}')"
+        docker exec "$SERVER" /command/s6-svstat /run/service/datanode 2>&1 | sed 's/^/    /'
+        docker logs "$SERVER"
+        exit 1
+    fi
+    echo "  datanode s6-svstat: up (waiting on hdfs_wait_for_namenode as expected)"
+
+    echo "=== SMOKE TEST PASSED (mode=${MODE}) ==="
+    exit 0
+fi
+
+# ---------------------------------------------------------------------
+# mount-ro / mount-rw mode short-circuits. The point of these modes is
+# to prove operator-mounted XMLs are preserved by the entrypoint (not
+# clobbered by the heredoc render) AND that envtoxml does NOT mutate
+# them. The full-cluster assertions below assume
+# HDFS_SERVICES=namenode,datanode with the heredoc XML — irrelevant
+# here.
+# ---------------------------------------------------------------------
+if [ "$MODE" = "mount-ro" ] || [ "$MODE" = "mount-rw" ]; then
+    echo "=== ${MODE} verification (operator XML preserved + envtoxml skipped) ==="
+
+    # The entrypoint runs synchronously and exits within a couple
+    # of seconds. 5s is plenty for simple-mode + mount to converge
+    # (no KDC, no NN/DN startup to wait for — the cluster
+    # intentionally can't come up with a 3-property XML).
+    sleep 5
+
+    # (1) Container must still be RUNNING. If the entrypoint
+    # FATAL'd (e.g. heredoc render broke, mountpoint -q rejected
+    # the bind), the container exits.
+    if ! docker ps --format '{{.Names}}' | grep -qx "$SERVER"; then
+        echo "FAIL: ${MODE} mode but container is not running"
+        docker logs "$SERVER" 2>/dev/null || true
+        exit 1
+    fi
+    echo "  container: still running"
+
+    # (2) Container's hdfs-site.xml must be byte-identical to
+    # the host file. The entrypoint's is_xml_overridden() guard
+    # must catch both :ro and :rw bind-mounts — the previous
+    # `[ ! -w ]`-only guard missed :rw and would have clobbered
+    # the operator's file via `cp -f`. We compare the full file
+    # contents (not just one property) so a heredoc-render
+    # overwriting the file is caught even if the marker happened
+    # to match.
+    HDFS_XML_CONTENT=$(docker exec "$SERVER" cat /opt/hadoop/etc/hadoop/hdfs-site.xml 2>/dev/null || true)
+    if [ -z "$HDFS_XML_CONTENT" ]; then
+        echo "FAIL: could not read container's hdfs-site.xml"
+        docker logs "$SERVER"
+        exit 1
+    fi
+    HOST_XML_CONTENT=$(cat "${SMOKE_TMPDIR}/hdfs-site.xml" 2>/dev/null || true)
+    if [ "$HDFS_XML_CONTENT" != "$HOST_XML_CONTENT" ]; then
+        echo "FAIL: container's hdfs-site.xml was mutated by entrypoint"
+        echo "  --- container (len=${#HDFS_XML_CONTENT}):"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        echo "  --- host (len=${#HOST_XML_CONTENT}):"
+        echo "$HOST_XML_CONTENT" | sed 's/^/    /'
+        docker logs "$SERVER"
+        exit 1
+    fi
+    echo "  container hdfs-site.xml == host hdfs-site.xml (byte-identical, no clobber)"
+
+    # (3) Env var HDFS-SITE.XML_dfs.replication=999 must NOT have
+    # mutated the XML. The host file has dfs.replication=7 and
+    # the env var said =999; the rendered file must still say =7
+    # AND must NOT contain =999 (envtoxml would have appended or
+    # overwritten to =999).
+    if ! echo "$HDFS_XML_CONTENT" | grep -q '<name>dfs.replication</name><value>7</value>'; then
+        echo "FAIL: host XML's dfs.replication=7 was not preserved"
+        echo "  envtoxml mutated operator XML or the file got clobbered:"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    if echo "$HDFS_XML_CONTENT" | grep -q '<value>999</value>'; then
+        echo "FAIL: env var HDFS-SITE.XML_dfs.replication=999 landed in operator XML"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  env vars skipped: dfs.replication=7 (operator default, not env=999)"
+
+    # (4) Mode-specific sentinel marker in the host file's
+    # <value> tag. If the entrypoint clobbered the file with the
+    # heredoc render, the marker would be gone (heredoc has no
+    # smoke.test.marker property at all).
+    if [ "$MODE" = "mount-ro" ]; then
+        MARKER="HOST_FILE_RO"
+    else
+        MARKER="HOST_FILE_RW"
+    fi
+    if ! echo "$HDFS_XML_CONTENT" | grep -q "<value>${MARKER}</value>"; then
+        echo "FAIL: sentinel marker '${MARKER}' missing from container XML"
+        echo "  (entrypoint clobbered operator's XML with heredoc render?)"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  sentinel marker present: ${MARKER}"
+
+    # (5) Verify the heredoc render did NOT run on the mounted
+    # file. The heredoc has 25+ properties; the host file has 3.
+    # If the heredoc render wrote to the bind-mounted path, we'd
+    # see lots of kerberos / bind-host properties — none should
+    # be present.
+    if echo "$HDFS_XML_CONTENT" | grep -q 'dfs.namenode.kerberos.principal'; then
+        echo "FAIL: heredoc render ran against operator's XML"
+        echo "  (heredoc-only property dfs.namenode.kerberos.principal appeared)"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  heredoc render skipped: no heredoc-only properties in operator XML"
+
+    # (6) For mount-rw only: verify the host file's mtime is
+    # unchanged. The heredoc render would write via `cp -f` to
+    # the bind-mounted path on :rw, updating mtime. A clean
+    # mount should leave mtime alone. (skip on :ro — the
+    # filesystem would refuse the write anyway and mtime is not
+    # a meaningful check.)
+    if [ "$MODE" = "mount-rw" ]; then
+        # Wait briefly to ensure any write attempt has settled,
+        # then stat both. The container's view of the file is
+        # what matters; mtime differences > 2s indicate a write.
+        sleep 2
+        HOST_MTIME=$(stat -c %Y "${SMOKE_TMPDIR}/hdfs-site.xml" 2>/dev/null || stat -f %m "${SMOKE_TMPDIR}/hdfs-site.xml" 2>/dev/null || echo 0)
+        # The container's view of the bind-mount's mtime should
+        # match the host's mtime. If the entrypoint wrote to the
+        # file, mtime would be NEWER on the host (because :rw
+        # binds go through the host's filesystem for writes).
+        CONT_MTIME=$(docker exec "$SERVER" stat -c %Y /opt/hadoop/etc/hadoop/hdfs-site.xml 2>/dev/null \
+            || docker exec "$SERVER" stat -f %m /opt/hadoop/etc/hadoop/hdfs-site.xml 2>/dev/null \
+            || echo 0)
+        if [ "$HOST_MTIME" = "0" ] || [ "$CONT_MTIME" = "0" ]; then
+            echo "WARN: could not stat mtime (HOST=$HOST_MTIME CONT=$CONT_MTIME); skipping mtime check"
+        elif [ "$CONT_MTIME" -gt "$((HOST_MTIME + 2))" ]; then
+            echo "FAIL: container's mtime (${CONT_MTIME}) > host's mtime (${HOST_MTIME})"
+            echo "  (entrypoint wrote to the bind-mounted file despite is_xml_overridden guard)"
+            docker logs "$SERVER"
+            exit 1
+        else
+            echo "  mtime: host=${HOST_MTIME} container=${CONT_MTIME} (consistent, no writes)"
+        fi
+    fi
+
+    echo "=== SMOKE TEST PASSED (mode=${MODE}) ==="
+    exit 0
+fi
+
+# ---------------------------------------------------------------------
+# disable-envtoxml mode short-circuits. The point is to prove
+# HDFS_DISABLE_ENVTOXML=1 makes the entrypoint skip envtoxml (env vars
+# don't land) while still rendering the heredoc + sed substitution.
+# The full-cluster assertions below assume NN + DN + dfsadmin — those
+# won't come up in this mode because the simple-mode auto-strip didn't
+# run (envtoxml was skipped), so the kerberos-only properties stay in
+# the XML and the daemons refuse to start with no KDC. That's
+# expected — we exit before those checks.
+# ---------------------------------------------------------------------
+if [ "$MODE" = "disable-envtoxml" ]; then
+    echo "=== disable-envtoxml verification (envtoxml skipped, heredoc rendered) ==="
+
+    # Same 5s settle as the mount modes — entrypoint runs
+    # synchronously, no daemons to wait for.
+    sleep 5
+
+    # (1) Container must still be RUNNING.
+    if ! docker ps --format '{{.Names}}' | grep -qx "$SERVER"; then
+        echo "FAIL: disable-envtoxml mode but container is not running"
+        docker logs "$SERVER" 2>/dev/null || true
+        exit 1
+    fi
+    echo "  container: still running"
+
+    # (2) The entrypoint must have rendered the heredoc + applied
+    # sed placeholder substitution. dfs.replication=1 (heredoc
+    # default), not =999 from the env var.
+    HDFS_XML_CONTENT=$(docker exec "$SERVER" cat /opt/hadoop/etc/hadoop/hdfs-site.xml 2>/dev/null || true)
+    if [ -z "$HDFS_XML_CONTENT" ]; then
+        echo "FAIL: could not read container's hdfs-site.xml"
+        docker logs "$SERVER"
+        exit 1
+    fi
+    if ! echo "$HDFS_XML_CONTENT" | grep -q '<name>dfs.replication</name><value>1</value>'; then
+        echo "FAIL: heredoc render broken (dfs.replication should =1)"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  heredoc render ok: dfs.replication=1 (env var =999 did NOT override)"
+
+    # (3) Env var HDFS-SITE.XML_dfs.replication=999 must NOT have
+    # landed. (The heredoc has dfs.replication=1; we passed =999;
+    # the rendered file should say =1, not =999.)
+    if echo "$HDFS_XML_CONTENT" | grep -q '<value>999</value>'; then
+        echo "FAIL: env var HDFS-SITE.XML_dfs.replication=999 landed in XML"
+        echo "  HDFS_DISABLE_ENVTOXML=1 did NOT skip envtoxml"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  envtoxml skipped: dfs.replication env var did NOT land"
+
+    # (4) New env var smoke.test.envvar=SHOULD_NOT_LAND must NOT
+    # be present. envtoxml was skipped entirely, so no appends.
+    if echo "$HDFS_XML_CONTENT" | grep -q 'smoke.test.envvar'; then
+        echo "FAIL: envtoxml appended smoke.test.envvar to XML"
+        echo "  HDFS_DISABLE_ENVTOXML=1 did NOT skip envtoxml"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  envtoxml skipped: smoke.test.envvar=SHOULD_NOT_LAND not in XML"
+
+    # (5) Loud WARN about disable-envtoxml + simple-mode clash
+    # must have been logged. The simple-mode auto-strip is
+    # implemented INSIDE the envtoxml pass, so disabling envtoxml
+    # in simple mode leaves the kerberos-only properties in the
+    # XML. The entrypoint prints a loud WARN to stderr for this
+    # combination; docker logs captures both streams.
+    WARN=$(docker logs "$SERVER" 2>&1 | grep -F 'HDFS_DISABLE_ENVTOXML=1 + HADOOP_SECURITY_AUTHENTICATION=simple' || true)
+    if [ -z "$WARN" ]; then
+        echo "FAIL: expected WARN about HDFS_DISABLE_ENVTOXML+simple clash was NOT logged"
+        echo "  the entrypoint should print a loud warning before exec /init"
+        docker logs "$SERVER" 2>&1 | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  WARN logged: HDFS_DISABLE_ENVTOXML+simple clash (expected, see entrypoint:89-117)"
+
+    # (6) Verify the kerberos-only properties DID stay in the XML
+    # (because envtoxml was skipped, so the simple-mode auto-strip
+    # didn't run). This is the expected consequence of the WARN
+    # above; we confirm by checking at least one stayed.
+    if ! echo "$HDFS_XML_CONTENT" | grep -q 'dfs.namenode.kerberos.principal'; then
+        echo "FAIL: dfs.namenode.kerberos.principal missing from rendered XML"
+        echo "  (envtoxml-skip branch should have left it in place)"
+        echo "$HDFS_XML_CONTENT" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  kerberos-only property preserved: dfs.namenode.kerberos.principal still in XML (expected)"
+
+    # (7) Verify the entrypoint actually took the disable-envtoxml
+    # branch — the entrypoint logs a specific message
+    # "envtoxml disabled (HDFS_DISABLE_ENVTOXML=1)" for each XML
+    # it skipped.
+    SKIP_MSG=$(docker logs "$SERVER" 2>&1 | grep -F 'envtoxml disabled (HDFS_DISABLE_ENVTOXML=1)' || true)
+    if [ -z "$SKIP_MSG" ]; then
+        echo "FAIL: entrypoint did not log 'envtoxml disabled' message"
+        echo "  (HDFS_DISABLE_ENVTOXML branch not taken?)"
+        docker logs "$SERVER" 2>&1 | sed 's/^/    /'
+        exit 1
+    fi
+    SKIP_COUNT=$(echo "$SKIP_MSG" | wc -l)
+    if [ "$SKIP_COUNT" != "2" ]; then
+        echo "FAIL: expected 2 'envtoxml disabled' log lines (hdfs-site + core-site), got $SKIP_COUNT"
+        echo "$SKIP_MSG" | sed 's/^/    /'
+        exit 1
+    fi
+    echo "  'envtoxml disabled' logged for both XMLs (hdfs-site + core-site)"
+
+    echo "=== SMOKE TEST PASSED (mode=${MODE}) ==="
+    exit 0
+fi
+
+# ---------------------------------------------------------------------
+# empty HDFS_SERVICES mode short-circuits. The point is to prove the
+# entrypoint accepts an explicitly-empty HDFS_SERVICES value without
+# falling back to a default. `: ${VAR:=default}` substitutes on empty
+# values too, so the entrypoint's `: ${HDFS_SERVICES:=…}` line had
+# to be removed to support empty-profile deployments. The remaining
+# `${VAR+set}` probe correctly distinguishes "unset" from "set to
+# empty" so the default block only fires for genuinely unset values.
+# ---------------------------------------------------------------------
+if [ "$MODE" = "empty" ]; then
+    echo "=== empty HDFS_SERVICES verification (no services started) ==="
+
+    # No daemons to wait for — entrypoint runs synchronously and
+    # exec's /init, which runs an empty s6 bundle forever.
+    sleep 5
+
+    # (1) Container must still be RUNNING. No services = no
+    # crashes possible.
+    if ! docker ps --format '{{.Names}}' | grep -qx "$SERVER"; then
+        echo "FAIL: empty mode but container is not running"
+        echo "  (entrypoint FATAL'd on empty HDFS_SERVICES?)"
+        docker logs "$SERVER" 2>/dev/null || true
+        exit 1
+    fi
+    echo "  container: still running (entrypoint accepted empty HDFS_SERVICES)"
+
+    # (2) s6-rc bundle must NOT contain any of the 4 Hadoop
+    # services. The user bundle was compiled with no contents.d/
+    # files (the for-loop iterates 0 times over an empty
+    # HDFS_SERVICES).
+    BUNDLE=$(docker exec "$SERVER" /command/s6-rc -a list 2>/dev/null || true)
+    if [ -z "$BUNDLE" ]; then
+        echo "FAIL: 's6-rc -a list' returned no output"
+        docker logs "$SERVER"
+        exit 1
+    fi
+    for svc in namenode datanode krb5kdc kadmind; do
+        if echo "$BUNDLE" | grep -qx "$svc"; then
+            echo "FAIL: empty mode but '${svc}' IS in s6-rc bundle"
+            echo "  bundle:"; echo "$BUNDLE" | sed 's/^/    /'
+            exit 1
+        fi
+    done
+    echo "  bundle: empty user bundle (none of namenode/datanode/krb5kdc/kadmind present)"
+
+    # (3) No services bound any port. We check 88 (KDC), 464
+    # (kadmind), 8020 (NN RPC), 9870 (NN HTTP), 9866 (DN data),
+    # 9864 (DN HTTP). Use /proc/net/tcp[6] like the issue #11
+    # check.
+    PROC_TCP=$(docker exec "$SERVER" cat /proc/net/tcp 2>/dev/null || true)
+    PROC_TCP6=$(docker exec "$SERVER" cat /proc/net/tcp6 2>/dev/null || true)
+    if [ -z "$PROC_TCP" ] || [ -z "$PROC_TCP6" ]; then
+        echo "FAIL: could not read /proc/net/tcp[6] inside container"
+        exit 1
+    fi
+    FAIL_PORT=0
+    for port in 88 464 8020 9870 9866 9864; do
+        port_hex=$(printf '%04X' "$port")
+        v4=$(echo "$PROC_TCP" | awk -v p=":$port_hex" \
+            '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
+        v6=$(echo "$PROC_TCP6" | awk -v p=":$port_hex" \
+            '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
+        if [ -n "$v4" ] || [ -n "$v6" ]; then
+            echo "FAIL: port $port (0x$port_hex) has a LISTEN — should be unbound"
+            echo "      v4=$v4 v6=$v6"
+            FAIL_PORT=1
+        fi
+    done
+    if [ "$FAIL_PORT" = "1" ]; then
+        docker logs "$SERVER"
+        exit 1
+    fi
+    echo "  ports: 88/464/8020/9870/9866/9864 all unbound (no longruns started)"
+
+    # (4) The entrypoint logged the resolved layout. The log
+    # line must show the literal empty value (HDFS_SERVICES=
+    # with no value after) and NOT a substituted default like
+    # `namenode,datanode,krb5kdc,kadmind`.
+    #
+    # Two checks:
+    #   (a) The layout line was logged at all (sanity).
+    #   (b) The value between `=` and ` (` is empty, NOT a
+    #       substituted default. We grep for the exact empty
+    #       form: `HDFS_SERVICES= (HADOOP` — literal space
+    #       immediately after the `=`. A substituted default
+    #       would put a name (e.g. `namenode`) right after the
+    #       `=` and would NOT match this pattern.
+    #
+    # Both greps use BRE (no -E) so `(` is a literal paren,
+    # avoiding the ERE grouping-escape trap.
+    LOG=$(docker logs "$SERVER" 2>&1)
+    LAYOUT_LINE=$(echo "$LOG" | grep 'HDFS_SERVICES=.*HADOOP_SECURITY_AUTHENTICATION' | head -1 || true)
+    if [ -z "$LAYOUT_LINE" ]; then
+        echo "FAIL: entrypoint log missing 'HDFS_SERVICES=…(HADOOP_SECURITY_…)' layout line"
+        echo "$LOG" | grep -i HDFS_SERVICES | sed 's/^/    /' || true
+        exit 1
+    fi
+    # Default-substitution test: empty value → `=` immediately
+    # followed by space. Default value → `=` followed by a name.
+    if ! echo "$LAYOUT_LINE" | grep -q 'HDFS_SERVICES= (HADOOP'; then
+        echo "FAIL: entrypoint substituted a default for empty HDFS_SERVICES"
+        echo "  expected: HDFS_SERVICES= (HADOOP_SECURITY_AUTHENTICATION=…)"
+        echo "  got:      ${LAYOUT_LINE}"
+        exit 1
+    fi
+    echo "  entrypoint log shows HDFS_SERVICES= (empty value, not substituted)"
+
+    echo "=== SMOKE TEST PASSED (mode=${MODE}) ==="
+    exit 0
 fi
 
 echo "=== Waiting for NameNode (dfsadmin -report) ==="
@@ -395,7 +1235,15 @@ if [ "$MODE" = "kerberos" ]; then
 fi
 
 if [ "$MODE" = "simple" ]; then
-    echo "=== Verifying envtoxml injection (simple: 7 !remove + 2 overwrite) ==="
+    # Verify the entrypoint's simple-mode auto-strip landed
+    # correctly in the rendered XMLs (issues #13, #14). The
+    # entrypoint injects 8 hdfs-site.xml + 2 core-site.xml
+    # overrides into the envtoxml child process — see
+    # rootfs/docker-entrypoint.sh. The assertions below
+    # confirm those overrides were applied: 7 !remove + 1
+    # overwrite on hdfs-site.xml, 1 !remove + 1 overwrite on
+    # core-site.xml.
+    echo "=== Verifying simple-mode auto-strip (entrypoint, no env vars) ==="
 
     # (a) 7 kerberos-only properties must be GONE from hdfs-site.xml.
     #     Each is a keytab path, an SPN, or a SASL transport

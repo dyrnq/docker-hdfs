@@ -86,9 +86,11 @@ make build-ubuntu up-ubuntu
 | `HDFS_NAMENODE_AUTO_FORMAT`  | no       | `true`       | If `true` (default), the NameNode formats on first boot when `/var/lib/hadoop/namenode/current` is missing. Set to `false` to disable silent auto-format (e.g. when mounting a pre-formatted volume that must not be touched). |
 | `HDFS_NAMENODE_FORCE_FORMAT` | no       | `false`      | If `true`, the NameNode formats unconditionally on every boot, wiping any existing fsimage. Destructive. Takes priority over `AUTO_FORMAT`. |
 | `HADOOP_SECURITY_AUTHENTICATION` | no   | `kerberos`  | `kerberos` (default, embedded KDC) or `simple`. In `simple` mode the entrypoint (a) strips the `krb5kdc` + `kadmind` s6 services and (b) skips KDC bootstrap, keytab generation, and the self-signed keystore. The sed substitution below also rewrites `hadoop.security.authentication` in `core-site.xml` from the `__HADOOP_SECURITY_AUTHENTICATION__` placeholder to `simple`, which is enough to flip the s6 run scripts (`hdfs-common.sh: hdfs_auth_mode` reads the XML as the source of truth — defensive against a typo'd or hand-edited XML). The sed substitution does NOT touch the rest of the XML: `core-site.xml` keeps `hadoop.security.authorization=true` and `hadoop.rpc.protection=authentication`, and `hdfs-site.xml` keeps the kerberos principal/keytab/block-token properties. Those are harmless without a KDC (the principals never resolve, `dfs.http.policy` defaults to HTTP_ONLY so the missing keystore is fine). To produce a clean Simple-auth cluster — no leftover `*kerberos.principal` / `*.keytab.file` / `dfs.data.transfer.protection` / `hadoop.rpc.protection`, and `dfs.block.access.token.enable=false` + `hadoop.security.authorization=false` — set `HADOOP_SECURITY_AUTHENTICATION=simple` AND the env recipe in the next section. |
+| `HDFS_SERVICES`              | no       | `namenode,datanode,krb5kdc,kadmind` (kerberos) / `namenode,datanode` (simple) | Comma-separated subset of `{namenode, datanode, krb5kdc, kadmind}` — which s6-rc longruns to start in this container. The default depends on `HADOOP_SECURITY_AUTHENTICATION`: `kerberos` → all 4, `simple` → `namenode,datanode`. Use this directly to run a partial layout, e.g. `-e HDFS_SERVICES=krb5kdc,kadmind` to start a KDC-only container (no NN, no DN) for keytab distribution to other pods, `-e HDFS_SERVICES=namenode` to start an NN-only container (no DN, no KDC — e.g. a manual fsimage inspection), or `-e HDFS_SERVICES=datanode` to start a DN-only container pointing at a remote NN (`HDFS_NAMENODE_HOST=remote-nn`) and remote KDC (`KRB5_KDC=remote-kdc`). Unknown names are a hard error (typo guard). The entrypoint does **not** validate that the chosen subset "makes sense" against `HADOOP_SECURITY_AUTHENTICATION` — e.g. `HDFS_SERVICES=namenode,datanode` + `HADOOP_SECURITY_AUTHENTICATION=kerberos` is allowed; the NN/DN run scripts will loop-restart because `kinit` has no embedded KDC to talk to. Same for `HDFS_SERVICES=krb5kdc,kadmind` + `HADOOP_SECURITY_AUTHENTICATION=simple` (KDC services come up but skip work) and `HDFS_SERVICES=datanode` (DN's `hdfs_wait_for_namenode` times out). These combinations are deliberately permitted so the same image can fill any role in a multi-container deployment (NN-only, DN-only, KDC-only, NN+DN with remote KDC, etc.) — see the *Service layout* section below for the trade-off. |
 | `HDFS_KDC_WAIT_TIMEOUT`      | no       | `30`         | Number of attempts (≈2× wall seconds) the namenode + datanode run scripts poll the KDC port 88 for, before giving up with a FATAL log line. |
 | `HDFS_NAMENODE_WAIT_TIMEOUT` | no       | `60`         | Number of attempts (≈2× wall seconds) the datanode run script polls `dfsadmin -report` for, before giving up with a FATAL log line. |
 | `KEYSTORE_PASS`              | no       | `changeit`   | HTTPS self-signed keystore password. Ignored in simple mode (no keystore generated). |
+| `HDFS_DISABLE_ENVTOXML`      | no       | `0`          | Opt-out from the `<NAME>.XML_<key>` env-var injection (envtoxml pass). `=1` keeps the heredoc render + sed placeholder substitution but skips envtoxml entirely, so operator-supplied env vars do NOT mutate the rendered `hdfs-site.xml` / `core-site.xml`. Useful when an operator wants the heredoc defaults but does NOT want their `HDFS-SITE.XML_*` env vars to silently override them (no need to bind-mount `:ro`). **Interaction with simple mode**: the simple-mode auto-strip (issues #13, #14) is implemented INSIDE the envtoxml pass — disabling envtoxml in simple mode leaves the kerberos-only properties (`*kerberos.principal`, `*.keytab.file`, `dfs.data.transfer.protection`, `hadoop.rpc.protection`, etc.) in the rendered XML, and the NN/DN run scripts will fail to start (no KDC, but the XML says SASL is required). The entrypoint prints a loud `WARN:` to stderr for this combination; check `docker logs <name>` if you opt in to this combo and the daemons loop-restart. Bind-mounting your own XML (`:ro` or `:rw` — both are respected) is the alternative escape hatch if you need to skip envtoxml AND have a clean simple-mode XML. |
 
 ### Injecting arbitrary Hadoop XML config (`<NAME>.XML_<key>`)
 
@@ -117,21 +119,52 @@ docker run -e HDFS-SITE.XML_dfs.client.use.datanode.hostname=true \
   sentinel goes in the value, not the name — env names are restricted to
   `[-._a-zA-Z0-9]` (k8s ConfigMap keys reject `!`).
 - Values are XML-escaped (`& < >` …); config keys must match
-  `[A-Za-z0-9._-]` (others are skipped with a warning). Read-only
-  (bind-mounted) XMLs are left untouched — mount your own XML and you are
-  fully in charge.
+  `[A-Za-z0-9._-]` (others are skipped with a warning). **Bind-mounted
+  XMLs are left untouched, regardless of `:ro` / `:rw`**. The
+  entrypoint detects bind-mounts via `mountpoint -q` and skips both
+  the heredoc render (cp-back) AND the envtoxml pass for any
+  operator-mounted XML — mount your own file and you are fully in
+  charge. If you only need to disable the env-var injection but
+  don't want to mount a file, use `HDFS_DISABLE_ENVTOXML=1` instead.
 
 The most common use is overriding `dfs.namenode.rpc-address` in k8s (see
 the Notes below).
 
 ### Simple auth recipe (drop the kerberos template's KDC-specific properties)
 
-`HADOOP_SECURITY_AUTHENTICATION=simple` flips the run scripts off
-Kerberos, but the in-image `hdfs-site.xml` / `core-site.xml` are
-written for kerberos-first and still carry keytab paths, SPNs, and
-`hadoop.rpc.protection=authentication`. The cleanest deployment is
-to `!remove` the kerberos-only properties and overwrite the two
-auth-mode flags via envtoxml, in the same `docker run`:
+In the simplest case, `HADOOP_SECURITY_AUTHENTICATION=simple` is
+enough — the entrypoint now also **auto-strips** the kerberos-only
+properties from `hdfs-site.xml` / `core-site.xml` (issues #13, #14),
+so a one-env-var Simple-auth deployment is:
+
+```bash
+docker run -d --name hdfs \
+  -e HADOOP_SECURITY_AUTHENTICATION=simple \
+  -e HDFS_HOSTNAME=hdfs.test \
+  dyrnq/hdfs:latest
+```
+
+The same can be expressed via the more explicit `HDFS_SERVICES`
+form (preferred for new deployments — see the *Service layout*
+section below):
+
+```bash
+docker run -d --name hdfs \
+  -e HDFS_SERVICES=namenode,datanode \
+  -e HDFS_HOSTNAME=hdfs.test \
+  dyrnq/hdfs:latest
+```
+
+If you need a fully clean Simple-auth XML (e.g. you're scraping the
+file for a downstream tool that does its own auth-protocol
+detection), the auto-strip already does this — the rendered
+`hdfs-site.xml` will not contain any `*kerberos.principal` /
+`*.keytab.file` / `dfs.data.transfer.protection` /
+`dfs.web.authentication.kerberos.*` keys, and the
+`dfs.block.access.token.enable=false` + `hadoop.security.authorization=false`
+overwrites are applied as part of the same envtoxml pass. The
+pre-#98 manual recipe (the long list of `!remove` env vars) is
+no longer needed and is preserved here only as a reference:
 
 ```bash
 docker run -d --name hdfs \
@@ -150,13 +183,91 @@ docker run -d --name hdfs \
   dyrnq/hdfs:latest
 ```
 
-This is exactly what `scripts/smoke-test.sh` does in simple mode
-(the smoke test doubles as the documented recipe). For k8s, paste
-the env list into a `Deployment`'s `env:` array or a ConfigMap.
+For k8s, paste the env list into a `Deployment`'s `env:` array or
+a ConfigMap.
 
 Note: `dfs.datanode.hostname` is left in place — it's cosmetic
 (`DatanodeID.hostName` only) and matches `HDFS_HOSTNAME` after the
 entrypoint's sed pass, so leaving it is harmless.
+
+### Service layout (HDFS_SERVICES)
+
+The image runs four s6-rc longruns: `krb5kdc`, `kadmind`, `namenode`,
+`datanode`. `HDFS_SERVICES` lets you start a subset, so the same
+image can fill multiple roles in a deployment:
+
+| Shape                                 | `HDFS_SERVICES`                  | `HADOOP_SECURITY_AUTHENTICATION` | Use case |
+|---------------------------------------|----------------------------------|----------------------------------|----------|
+| Full kerberos cluster (default)       | `namenode,datanode,krb5kdc,kadmind` | `kerberos`                    | The canonical single-container deployment. All four longruns up, embedded KDC bootstrapped on first boot, hdfs keytab generated, NN + DN kinit against the embedded KDC. |
+| Simple auth cluster                   | `namenode,datanode`              | `simple`                        | No KDC, no keytab, no SASL. NN + DN up, no auth (think dev / integration test). Pass `-e HADOOP_SECURITY_AUTHENTICATION=simple` (the back-compat shorthand) or `-e HDFS_SERVICES=namenode,datanode` directly. |
+| KDC only (for keytab distribution)    | `krb5kdc,kadmind`                | `kerberos`                      | Runs the embedded KDC plus kadmind; **no NN, no DN**. Other pods in the cluster `kinit` against this container's KDC and pull keytabs. Useful when you want KDC HA or a dedicated realm in a multi-pod cluster without paying for a NN/DN on the KDC node. |
+| NN only (e.g. fsimage inspection)     | `namenode`                       | `kerberos` (or simple)           | Just the NameNode; no DataNode, no KDC. Useful for `hdfs dfs -ls /`-style ops against an existing fsimage (mount `/var/lib/hadoop/namenode`). |
+| Empty (no services)                   | `` (empty)                       | `kerberos` (or simple)           | `-e HDFS_SERVICES=` produces an empty s6 user bundle — no longruns start, no ports bind, the container sits at `s6-svscan` indefinitely. Useful as a "do nothing" container that still runs the entrypoint (so you can `docker exec` to inspect the rendered XMLs, run a one-shot kadmin command, or use it as a pod that just hosts a KDC volume without the KDC actually running). The KDC bootstrap block still runs (it's gated on `HADOOP_SECURITY_AUTHENTICATION`, not on `HDFS_SERVICES`) so a `-v kdc-volume:/var/lib/krb5kdc` container can be used to bootstrap the realm in one container and then run it under `HDFS_SERVICES=krb5kdc,kadmind` in another. |
+
+The entrypoint enforces **one** check and one only: **unknown
+service names are a hard error**. A typo
+(`HDFS_SERVICES=namebode,datanode`) does NOT degrade to "start
+the one valid name" — the entrypoint exits with FATAL listing
+the four valid options. Silently dropping the typo would mean a
+container with no NN and a confusing "the cluster is up but I
+can't reach it" symptom. Everything else is the operator's
+responsibility:
+
+- **Kerberos mode with no `krb5kdc` in the service set is
+  allowed.** NN/DN run scripts do `kinit -kt ... hdfs/...@REALM`;
+  if no KDC is in the container, kinit fails and the s6 service
+  marks itself down (loop-restart). This is the right behavior
+  for a multi-container deployment where the DN-only container
+  points `KRB5_KDC` at a remote KDC — the loop is the correct
+  signal that the remote KDC is unreachable, not a config bug.
+- **Simple mode with `krb5kdc` in the service set is allowed.**
+  The KDC services detect simple auth and skip kinit, so the KDC
+  sits idle. Wastes a port and a process; not a bug.
+- **`HADOOP_SECURITY_AUTHENTICATION=simple` is a back-compat
+  shorthand for `HDFS_SERVICES=namenode,datanode`.** Both work;
+  if both are set, `HDFS_SERVICES` wins. The shorthand is kept
+  for users on the previous behavior; new deployments should
+  prefer `HDFS_SERVICES` because it's explicit about which
+  longruns come up and doesn't conflate auth protocol with
+  service layout.
+
+#### How the dynamic build keeps `s6-rc-compile` happy
+
+The image ships **empty** `contents.d/` and `dependencies.d/`
+directories under `/etc/s6-overlay/s6-rc.d/` — no service is
+"on by default", and no dep edges exist at image-build time.
+The entrypoint is the sole source of truth:
+
+1. For each `svc` in `HDFS_SERVICES`, `touch
+   /etc/s6-overlay/s6-rc.d/user/contents.d/<svc>`. s6-rc-compile
+   keys off file existence (not content), so a missing file
+   means "not in the user bundle" — the cleanest way to drop a
+   service.
+2. For each known edge (`datanode → namenode`,
+   `namenode → krb5kdc`, `kadmind → krb5kdc`), `touch
+   <src>/dependencies.d/<tgt>` **only when both endpoints are
+   in `HDFS_SERVICES`**. If either is missing, no edge is
+   created — and s6-rc-compile sees a service with no dep,
+   which is valid.
+
+So a partial layout never trips s6-rc-compile on a dangling
+reference: edges only exist when both sides do. The trade-off
+is a non-functional container when the operator misconfigures
+(e.g. `HDFS_SERVICES=datanode` with no remote NN); the benefit
+is a single image that can fill every role in a deployment
+(full cluster, KDC-only, NN-only, DN-only, kdc+admin, …)
+without rebuilds.
+
+An **empty** `HDFS_SERVICES=` (`-e HDFS_SERVICES=` with no value)
+is also accepted — the for-loop iterates 0 times, no
+`contents.d/` files appear, `s6-rc-compile` produces an empty
+user bundle, and `/init` runs `s6-svscan` against an empty
+bundle (no supervised longruns, container stays up doing
+nothing). The default-fallback line in the entrypoint is
+carefully written as `if [ -z "${HDFS_SERVICES+set}" ]` (not
+`: ${HDFS_SERVICES:=default}`) because the `:-` form would
+substitute on the empty value too, clobbering an operator's
+explicit `-e HDFS_SERVICES=`.
 
 
 ## Build args
@@ -250,15 +361,49 @@ would catch — fmt drift and broken tests — before pushing. The Docker
 build still recompiles envtoxml from source in its builder stage; no
 separate build step is needed for the binary to land in the image.
 
+### Local build with Chinese mirrors (behind the GFW)
+
+`Dockerfile.debian.mirror` is a local-build-only variant that
+points apt, the Hadoop tarball, the s6-overlay release, and the
+Rust crates registry at CN mirrors + a GitHub proxy. It is
+**not git-tracked** (see `.gitignore: Dockerfile.*.mirror`) and
+is derived from `Dockerfile.debian` on demand. Use it for fast
+local builds on slow links:
+
+```bash
+make build-debian-mirror
+# Equivalent to:
+#   docker build -f Dockerfile.debian.mirror \
+#       --build-arg HTTP_PROXY=http://<local-proxy>:7890 \
+#       --build-arg HTTPS_PROXY=http://<local-proxy>:7890 \
+#       --tag dyrnq/hdfs:trixie-mirror .
+```
+
+The HTTP_PROXY/HTTPS_PROXY build args are honored by rustup
++ cargo inside the builder stage; cargo also uses the TUNA
+crates index by default, so no direct crates.io hit is needed.
+Same tags as `make build-debian` (just suffixed `-mirror`) so
+the smoke test picks the image up via `IMAGE=dyrnq/hdfs:debian-mirror-fresh ./scripts/smoke-test.sh …`.
+Do **not** push this image to a registry — the mirror variant
+exists only for individual contributors' local builds.
+
 ## Smoke test
 
 After building, run the end-to-end smoke test. The smoke test
 exercises both auth modes through the same entrypoint:
 
 ```bash
-make smoke-all                      # kerberos + simple
+make smoke-all                      # all 8 modes (kerberos, simple, kdc-only, datanode-only,
+                                     #   mount-ro, mount-rw, disable-envtoxml, empty)
 make smoke-kerberos                 # kerberos only
-make smoke-simple                   # simple only (mount-overrides)
+make smoke-simple                   # simple only (entrypoint auto-strip)
+make smoke-kdc-only                 # KDC-only (HDFS_SERVICES isolation)
+make smoke-datanode-only            # DN-only (dynamic dep build)
+make smoke-mount-ro                 # bind-mount hdfs-site.xml :ro + envtoxml env vars
+make smoke-mount-rw                 # bind-mount hdfs-site.xml :rw (regression for the
+                                     #   previous [ ! -w ]-only clobber bug)
+make smoke-disable-envtoxml         # HDFS_DISABLE_ENVTOXML=1 (env vars skipped, heredoc kept)
+make smoke-empty                    # HDFS_SERVICES= (empty profile, no services)
 ./scripts/smoke-test.sh simple dyrnq/hdfs:latest-ubuntu
 ```
 
@@ -281,19 +426,69 @@ In `simple` mode, the script:
 1. Launches the container with `-e HADOOP_SECURITY_AUTHENTICATION=
    simple` (the entrypoint detects this, strips the `krb5kdc` +
    `kadmind` s6 services, and skips KDC bootstrap + keytab +
-   keystore generation). It still bind-mounts
-   `scripts/conf/simple/{core,hdfs}-site.xml` over
-   `/opt/hadoop/etc/hadoop/` so the rendered XMLs carry
-   `Simple` + `HTTP_ONLY` and have no kerberos principal /
-   keytab / block-token properties.
+   keystore generation). No XML mount-override is needed — the
+   entrypoint's simple-mode auto-strip (issues #13, #14)
+   removes the kerberos-only properties from the heredoc-
+   rendered XMLs as part of the envtoxml pass. The test asserts
+   the 7 `!remove` + 2 overwrite sentinels all landed.
 2. Waits for NameNode + DataNode (no KDC, no kinit).
 3. Round-trips a file through `hdfs dfs -put` / `-cat`.
 
-> The simple-mode XML mounts are **read-only** (`:ro`). The
-> entrypoint's XML write-back is guarded by a `[ -w ]` test, so
-> read-only overrides simply pass through — Hadoop reads the
-> mounted XML directly and the entrypoint never tries to clobber
-> it.
+In `kdc-only` mode (HDFS_SERVICES isolation test):
+
+1. Launches the container with `-e HDFS_SERVICES=krb5kdc,kadmind`
+   and the default `HADOOP_SECURITY_AUTHENTICATION=kerberos` —
+   the KDC bootstrap path runs (so the realm + keytab get
+   generated on the volume) but the s6-rc tree is built from
+   scratch to start ONLY the KDC services (contents.d/ is
+   empty in the image; the entrypoint `touch`es only the two
+   KDC files).
+2. Waits for KDC port 88, reads `KRB5_PASS` from the volume.
+3. Verifies the s6-rc user bundle contains `krb5kdc` and
+   `kadmind` but does NOT contain `namenode` or `datanode`;
+   `ps -ef` cross-check confirms no NameNode / DataNode JVM is
+   alive. `hdfs dfs -ls` against the would-be NN RPC port must
+   fail (no NN to talk to). Passing these three checks means
+   the entrypoint's HDFS_SERVICES isolation actually isolates
+   — the most common failure mode (a partial mutation that
+   leaves an old `contents.d` from a prior launch behind) would
+   show up as `namenode` still being in the bundle.
+4. Runs `kinit testuser@REALM` against the embedded KDC to
+   prove the KDC services answer AS requests, not just that the
+   process is alive.
+
+In `datanode-only` mode (dynamic dep build test):
+
+1. Launches the container with `-e HDFS_SERVICES=datanode`
+   plus `-e HADOOP_SECURITY_AUTHENTICATION=simple`. The
+   entrypoint `touch`es a single `contents.d/datanode` file
+   and builds `datanode/dependencies.d/` empty (no `namenode`
+   → no edge). s6-rc-compile must accept this layout, and
+   the container must NOT FATAL — that's the whole point.
+2. Confirms the container is still running after s6 settles
+   (entrypoint didn't FATAL on the partial layout).
+3. Verifies the s6-rc bundle contains ONLY `datanode`; the
+   other three services are absent.
+4. Verifies `s6-svstat /run/service/{krb5kdc,kadmind,
+   namenode}` all report `down` (no longrun is up). Note that
+   `s6-supervise` daemons exist for compiled-but-not-bundled
+   services — that's normal s6-rc behavior, not a sign the
+   service is running; `s6-svstat` is the authoritative
+   signal.
+5. Cross-checks via `/proc/net/tcp[6]` that nothing is bound
+   on the KDC (88) or kadmind (464) ports.
+6. Confirms the datanode service itself is `up` (the run
+   script is in `hdfs_wait_for_namenode` — that is the
+   expected terminal state for a datanode-only container
+   with no NN to register with).
+
+> The simple-mode smoke does **not** bind-mount any XMLs — the
+> entrypoint's heredoc + auto-strip path is what's exercised, so
+> the rendered `/opt/hadoop/etc/hadoop/{core,hdfs}-site.xml`
+> inside the container is purely the product of the heredoc +
+> envtoxml `!remove` sentinels. The `mount-ro` and `mount-rw`
+> smoke modes are the dedicated tests for operator-mount
+> behavior.
 
 ## Notes
 
@@ -362,27 +557,45 @@ In `simple` mode, the script:
   files are ephemeral across `docker rm` + recreate — `docker logs`
   is the cross-restart record. Mount `/opt/hadoop/logs` yourself if
   you need the Hadoop files to survive. (GitHub issue #9.)
-- `krb5.conf`, `core-site.xml`, and `hdfs-site.xml` ship inside
-  the `rootfs/` tree (`rootfs/etc/krb5.conf` and
-  `rootfs/opt/hadoop/etc/hadoop/`) and are copied by the single
-  `COPY rootfs /` step at the bottom of each Dockerfile. The
-  XMLs use literal `__PLACEHOLDER__` tokens (`__HDFS_HOSTNAME__`,
-  `__KRB5_REALM__`, `__HADOOP_SECURITY_AUTHENTICATION__`, …) and
-  the entrypoint is the sole substitution point. Hand-editing
-  the XMLs in the repo root does nothing — edit the copies under
-  `rootfs/` instead.
+- `krb5.conf` ships inside the `rootfs/` tree
+  (`rootfs/etc/krb5.conf`) and is copied by the single
+  `COPY rootfs /` step at the bottom of each Dockerfile.
+  `core-site.xml` and `hdfs-site.xml` are NOT in the image —
+  the upstream Hadoop tarball ships empty
+  `<configuration></configuration>` files at
+  `/opt/hadoop/etc/hadoop/` (no kerberos, no replication factor,
+  no bind-host fixes), so the entrypoint produces the rendered
+  XMLs at container start from bash heredocs in
+  `rootfs/docker-entrypoint.sh` (functions `hdfs_site_xml` /
+  `core_site_xml`). The heredocs use literal `__PLACEHOLDER__`
+  tokens (`__HDFS_HOSTNAME__`, `__KRB5_REALM__`,
+  `__HADOOP_SECURITY_AUTHENTICATION__`, …) that the entrypoint's
+  sed pass substitutes — the entrypoint is the sole substitution
+  point. Issue #8 / #11 / #12 design notes live in XML comments
+  inside the heredoc. Hand-editing the rendered XML inside a
+  running container does nothing across `docker rm` + recreate;
+  edit the heredoc in the entrypoint and rebuild.
 - The entrypoint's XML write-back (`cp -f` to the in-image path)
-  is guarded by `[ -w ${HADOOP_ETC}/${f} ]`. If the XML is
-  bind-mounted read-only (the smoke test's simple mode does
-  this to inject `Simple` + `HTTP_ONLY` configs) the entrypoint
-  skips the write-back silently and Hadoop reads the mounted
-  XML directly. Operators who mount-override their own XMLs get
-  the same behavior for free.
+  AND the envtoxml merge pass are both gated on the
+  `is_xml_overridden()` helper, which checks `mountpoint -q` (a
+  bind-mount is detected regardless of `:ro` / `:rw`) OR
+  `[ ! -w ]` (read-only upper layer). Operators who mount their
+  own XML at `/opt/hadoop/etc/hadoop/{core,hdfs}-site.xml` get
+  full control: the heredoc render is skipped AND env vars are
+  not merged into the mounted file. This applies to `:rw` mounts
+  too — `mountpoint -q` catches bind-mounts independently of
+  writability, so the previous `[ ! -w ]`-only guard (which
+  silently clobbered operator XMLs on `:rw` mounts) no longer
+  applies. The `mount-ro` and `mount-rw` smoke modes are the
+  dedicated regression tests. If you only need to disable the
+  env-var injection but don't want to mount a file, use
+  `HDFS_DISABLE_ENVTOXML=1` instead.
 - **DataNode `ip_addr` / `dfs.namenode.rpc-address`** (GitHub issue #8):
   the NameNode records a DataNode's `ip_addr` as the **source IP of the
   DataNode→NameNode registration RPC** (Hadoop
   `DatanodeManager.registerDatanode` overwrites it — see the source refs
-  in the `hdfs-site.xml` comment). With `dfs.namenode.rpc-address=0.0.0.0`
+  in the `hdfs_site_xml` heredoc comment in
+  `rootfs/docker-entrypoint.sh`). With `dfs.namenode.rpc-address=0.0.0.0`
   the DataNode connects over loopback, so `ip_addr` is recorded as
   `127.0.0.1`, which breaks cross-pod clients (CSI nodeplugins,
   `opendal`/`hdfs-native`) that connect to DataNodes by `ip_addr`. The
