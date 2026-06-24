@@ -1088,72 +1088,100 @@ FIRST_IP=$(echo "$REPORT" | grep -E '^Name: ' | head -1 | awk '{print $2}' || tr
 echo "  DataNode Name: $FIRST_IP"
 
 # ---------------------------------------------------------------------
-# Issue #11 regression: the DataNode must have a LISTEN entry that
-# accepts IPv4 traffic, not IPv6-only.
+# Issue #11 / #15 regression: NN + DN listeners must bind IPv4-capable
+# sockets, not IPv6-only.
 #
-# On Debian 13 + OpenJDK 21, `InetSocketAddress("0.0.0.0", 9866)`
-# resolves IPv6-first (getAllByName("0.0.0.0") returns the IPv6
-# wildcard first when `net.ipv6.bindv6only=0`), so the JVM creates
-# only an IPv6 listener. IPv4-only clients (opendal, hdfs-native,
-# anything that resolves A-only) then get ECONNREFUSED on the
-# registered ip_addr. The fix: dfs.datanode.address=hostname:port
-# makes the DN bind a non-IPv6-wildcard address (in practice an
-# IPv4-mapped IPv6 socket on ::ffff:<resolved-ip>), which the
-# kernel routes to on IPv4 input. dfs.datanode.bind-host does NOT
-# exist in Hadoop 3.5.0 (only NN/Balancer/JN/Provided-aliasmap
-# have bind-host keys) so the hostname pattern alone is what
-# protects streaming + IPC + HTTPS sockets.
+# Background (issues #11, #12, #15): on Debian 13 + OpenJDK 21 with
+# `net.ipv6.bindv6only=0` (the Linux default), Java's
+# `InetSocketAddress("0.0.0.0", port)` resolves IPv6-first and creates
+# only an IPv6 listener — `[::]:port` in /proc/net/tcp6. IPv4-only
+# clients (opendal, hdfs-native, anything that resolves A-only) then
+# get ECONNREFUSED on the registered ip_addr. The hostname pattern
+# (dfs.datanode.address=hostname:port) worked around this for DN
+# data / http / https / ipc sockets (issues #11, #15 — ipc-address
+# added when the DN IPC port was caught), but NN's rpc-bind-host
+# stays at 0.0.0.0 to preserve the documented "ALL interfaces"
+# semantic (single-container dev, port-published docker). So 8020 /
+# 9870 still hit the dual-stack bind.
 #
-# Detection: a LISTEN on the port that is NOT the pure IPv6 wildcard
-# `00000000000000000000000000000000` is acceptable. The original bug
-# shows as that exact address in /proc/net/tcp6. The fix produces
-# either an IPv4 entry in /proc/net/tcp (`00000000:PORT` for the
-# wildcard) or an IPv4-mapped IPv6 entry in /proc/net/tcp6
-# (`0000000000000000FFFF0000<ipv4>:PORT`).
+# The fix landed as a Dockerfile ENV (Dockerfile.debian / Dockerfile.ubuntu
+# + their .mirror siblings): `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true`
+# makes the JVM open AF_INET sockets only — every bind goes to
+# /proc/net/tcp, none to /proc/net/tcp6. This single flag covers
+# issues #11, #12, and #15 simultaneously (issue #12 is the
+# DataNode info web server crashing on `[::1]:0` in k8s hostNetwork
+# pods — same JVM dual-stack root cause).
 #
-# We DO NOT use nc -z from inside the container to the container's
-# own IPv4: in dev env (linux bridge, bindv6only=0) the dual-stack
-# IPv6 listener ACCEPTS IPv4-mapped connections, so nc -z would pass
-# even when the regression is present. /proc/net/tcp[6] is the
-# authoritative source.
+# Detection:
+#   1. JAVA_TOOL_OPTIONS env must contain `preferIPv4Stack=true` —
+#      if the Dockerfile ENV didn't land, the rest of the check would
+#      silently regress to issue #15 state.
+#   2. /proc/net/tcp has a LISTEN on every hadoop port: 8020 (NN RPC),
+#      9870 (NN HTTP), 9864 (DN HTTP), 9866 (DN data), 9867 (DN IPC).
+#      9865 (DN HTTPS) is omitted: the heredoc's dfs.http.policy=
+#      HTTP_ONLY means no HTTPS listener — adding HDFS-SITE.XML_
+#      dfs.http.policy=HTTPS_ONLY would re-bind it, but that's an
+#      operator override not the default smoke-test scope.
+#
+# /proc/net/tcp6 is read but only checked for the absence of LISTENs
+# — with preferIPv4Stack=true the JVM should create zero IPv6 sockets,
+# so any LISTEN in tcp6 indicates the stack preference did NOT take
+# effect (operator override) but the test still passes as long as
+# IPv4 LISTENs exist.
+#
+# We do NOT use nc -z against the container's own IPv4: on a
+# dual-stack dev host the kernel routes IPv4 input to an IPv6
+# wildcard listener, so nc -z would pass even when the regression is
+# present. /proc/net/tcp is the authoritative source.
 # ---------------------------------------------------------------------
-echo "=== Verifying DataNode IPv4 listener (issue #11) ==="
+echo "=== Verifying hadoop ports bind IPv4 (issues #11/#15) ==="
+JAVA_TOOL_OPTIONS_ENV=$(docker exec "$SERVER" sh -c 'echo "${JAVA_TOOL_OPTIONS:-}"' 2>/dev/null || true)
+if ! echo "$JAVA_TOOL_OPTIONS_ENV" | grep -q 'preferIPv4Stack=true'; then
+    echo "FAIL: JAVA_TOOL_OPTIONS not set to preferIPv4Stack=true in container env"
+    echo "  got: '${JAVA_TOOL_OPTIONS_ENV:-<unset>}'"
+    echo "  Dockerfile ENV JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true did NOT land"
+    docker logs "$SERVER"
+    exit 1
+fi
+echo "  JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS_ENV}"
+
 PROC_TCP=$(docker exec "$SERVER" cat /proc/net/tcp 2>/dev/null || true)
 PROC_TCP6=$(docker exec "$SERVER" cat /proc/net/tcp6 2>/dev/null || true)
-if [ -z "$PROC_TCP" ] || [ -z "$PROC_TCP6" ]; then
-    echo "FAIL: could not read /proc/net/tcp[6] inside container"
+if [ -z "$PROC_TCP" ]; then
+    echo "FAIL: could not read /proc/net/tcp inside container"
     exit 1
 fi
 FAIL=0
-for port in 9864 9866; do
+for port in 8020 9870 9864 9866 9867; do
     port_hex=$(printf '%04X' "$port")
-    # IPv4 LISTEN (wildcard or specific): local_address ends with :PORT
-    # and st=0A.  Format  "00000000:PORT"  or  "XXXXXXXX:PORT".
+    # IPv4 LISTEN (wildcard or specific): local_address ends with
+    # :PORT and st=0A.  Format "00000000:PORT" or "XXXXXXXX:PORT".
     v4=$(echo "$PROC_TCP" | awk -v p=":$port_hex" \
         '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
-    # IPv6 LISTEN, EXCLUDING the pure IPv6 wildcard
-    # 00000000000000000000000000000000. An IPv4-mapped IPv6 entry
-    # looks like 0000000000000000FFFF0000<ipv4hex>:PORT.
-    v6=$(echo "$PROC_TCP6" | awk -v p=":$port_hex" \
-        '$2 ~ p"$" && $4 == "0A" && $2 !~ /^00000000000000000000000000000000:/ {print $2; exit}')
-    if [ -n "$v4" ] || [ -n "$v6" ]; then
-        echo "  port $port LISTEN: ${v4:+(ipv4) $v4}${v6:+(ipv6-mapped) $v6}"
-    else
-        # No IPv4 wildcard AND no non-wildcard IPv6 entry → the
-        # listener is IPv6-only (the bug). Surface the IPv6 entry
-        # if any, so the operator sees exactly what was bound.
+    if [ -z "$v4" ]; then
+        # No IPv4 LISTEN on this port. Surface the IPv6 LISTEN
+        # (if any) so the operator sees what happened.
         v6_wild=$(echo "$PROC_TCP6" | awk -v p=":$port_hex" \
             '$2 ~ p"$" && $4 == "0A" {print $2; exit}')
-        echo "FAIL: port $port (0x$port_hex) is IPv6-only — issue #11 regression"
+        echo "FAIL: port $port (0x$port_hex) has NO IPv4 LISTEN — issues #11/#15 regression"
         echo "      IPv6 wildcard LISTEN: ${v6_wild:-none}"
         FAIL=1
+    else
+        echo "  port $port (0x$port_hex) LISTEN: $v4 (ipv4)"
     fi
 done
+# Cross-check: /proc/net/tcp6 should have NO LISTENs with the JVM
+# stack preference on. If the operator overrode JAVA_TOOL_OPTIONS to
+# disable it (e.g. for IPv6-only clusters) we expect ipv6 LISTENs;
+# warn but don't fail.
+TCP6_LISTENS=$(echo "$PROC_TCP6" | awk '$4 == "0A"' || true)
+if [ -n "$TCP6_LISTENS" ]; then
+    echo "  /proc/net/tcp6 has LISTENs (operator may have disabled preferIPv4Stack)"
+    echo "$TCP6_LISTENS" | awk '{printf "    %s\n", $2}'
+fi
 if [ "$FAIL" = "1" ]; then
     echo "  /proc/net/tcp (IPv4) dump:"
     echo "$PROC_TCP" | sed 's/^/    /'
-    echo "  /proc/net/tcp6 (IPv6) dump:"
-    echo "$PROC_TCP6" | sed 's/^/    /'
     docker logs "$SERVER"
     exit 1
 fi
