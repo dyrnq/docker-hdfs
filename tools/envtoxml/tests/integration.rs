@@ -337,3 +337,169 @@ fn mixed_remove_overwrite_append_in_one_run() {
     assert!(c.contains("<name>dfs.extra</name>"), "appended");
     assert_eq!(c.matches("dfs.namenode.rpc-address").count(), 1, "no dup");
 }
+
+// -------------------------------------------------------------------------
+// --create / ENVTOXML_CREATE tests
+//
+// The create mode lets the entrypoint (or a user) opt in to having
+// envtoxml write a fresh minimal <configuration/> skeleton if the
+// target file does NOT exist. Backward compat: without --create,
+// missing file + overrides is still a hard error (operator typo).
+// Missing file + no overrides remains a noop success (unchanged).
+// -------------------------------------------------------------------------
+
+/// Helper: invoke envtoxml with an extra `--create` flag and
+/// per-call env overrides. Mirrors `run()` but passes the flag.
+fn run_create(file: &PathBuf, env_overrides: &[(&str, &str)]) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--create");
+    cmd.arg(file);
+    cmd.env_clear();
+    cmd.env("PATH", env::var("PATH").unwrap_or_default());
+    for (k, v) in env_overrides {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run envtoxml");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A unique path that does NOT exist yet. Using a path inside the
+/// per-test tempdir keeps parallel test runs isolated without
+/// needing a teardown step.
+/// A unique path that does NOT exist yet, named `hdfs-site.xml` so
+/// the standard `HDFS-SITE.XML_*` env var prefix matches by
+/// default. Each test gets its own tempdir (see `tempfile_dir`),
+/// so parallel test runs don't collide.
+fn missing_path() -> PathBuf {
+    let dir = tempfile_dir();
+    dir.join("hdfs-site.xml")
+}
+
+#[test]
+fn create_mode_writes_empty_skeleton_when_no_overrides() {
+    // --create + missing file + no overrides → write a minimal
+    // valid <configuration/> so subsequent boots see a well-formed
+    // file. Without this, the entrypoint's noop fast path would
+    // leave the file absent (consistent with old behavior, but
+    // useless for the "boot a fresh cluster from zero XML" case).
+    let f = missing_path();
+    assert!(!f.exists());
+    let (ok, _, stderr) = run_create(&f, &[]);
+    assert!(ok, "create+no-overrides should succeed: {stderr}");
+    assert!(f.exists(), "file must be created");
+    let c = content(&f);
+    assert!(c.contains("<?xml"), "well-formed XML prolog");
+    assert!(c.contains("<configuration>"));
+    assert!(c.contains("</configuration>"));
+    assert!(
+        stderr.contains("created empty"),
+        "stderr should announce creation: {stderr}"
+    );
+}
+
+#[test]
+fn create_mode_does_not_overwrite_existing_file() {
+    // --create + existing file (with content) + no overrides →
+    // leave the file untouched. --create is opt-in for the
+    // missing-file case only.
+    let f = fixture(MINIMAL);
+    let before = content(&f);
+    let (ok, _, _) = run_create(&f, &[]);
+    assert!(ok);
+    assert_eq!(content(&f), before, "file must not be overwritten");
+}
+
+#[test]
+fn create_mode_appends_overrides_to_brand_new_file() {
+    // --create + missing file + overrides → create skeleton, then
+    // merge overrides into it. End result: a single XML with just
+    // the override properties (no spurious duplication, no leftover
+    // boilerplate that merge_file can't see).
+    let f = missing_path();
+    assert!(!f.exists());
+    let (ok, _, stderr) = run_create(
+        &f,
+        &[
+            ("HDFS-SITE.XML_dfs.replication", "3"),
+            ("HDFS-SITE.XML_dfs.namenode.rpc-address", "nn:8020"),
+        ],
+    );
+    assert!(ok, "create+overrides should succeed: {stderr}");
+    let c = content(&f);
+    assert!(c.contains("<name>dfs.replication</name><value>3</value>"));
+    assert!(c.contains("<name>dfs.namenode.rpc-address</name><value>nn:8020</value>"));
+    assert!(c.contains("</configuration>"), "well-formed close");
+    assert_eq!(c.matches("dfs.replication").count(), 1, "no dup");
+    assert_eq!(c.matches("dfs.namenode.rpc-address").count(), 1, "no dup");
+    assert!(
+        stderr.contains("created empty") || stderr.contains("created empty (--create"),
+        "stderr should announce creation: {stderr}"
+    );
+    assert!(stderr.contains("merged 2 override"), "merge log: {stderr}");
+}
+
+#[test]
+fn create_mode_off_with_no_overrides_keeps_noop_behavior() {
+    // Backward compat: no flag, no overrides, missing file → exit 0,
+    // file NOT created. Operators who don't opt in keep the
+    // historic behavior.
+    let f = missing_path();
+    assert!(!f.exists());
+    let (ok, _, _) = run(&f, &[]);
+    assert!(ok, "missing file + no overrides is still success");
+    assert!(!f.exists(), "file must NOT be created without --create");
+}
+
+#[test]
+fn create_mode_off_with_overrides_still_errors_on_missing_file() {
+    // Backward compat: no flag, has overrides, missing file → hard
+    // error. The operator almost certainly typoed; failing loud is
+    // correct.
+    let f = missing_path();
+    let (ok, _, stderr) = run(&f, &[("HDFS-SITE.XML_dfs.x", "1")]);
+    assert!(
+        !ok,
+        "missing file + overrides + no --create is a hard error"
+    );
+    assert!(stderr.contains("read "), "stderr: {stderr}");
+}
+
+#[test]
+fn create_mode_via_env_knob() {
+    // The entrypoint sometimes cannot pass argv (e.g. when invoked
+    // from a `case` that already built the argv), so we also
+    // accept ENVTOXML_CREATE=1. Same observable behavior as the
+    // --create flag.
+    let f = missing_path();
+    let mut cmd = Command::new(bin());
+    cmd.arg(&f);
+    cmd.env_clear();
+    cmd.env("PATH", env::var("PATH").unwrap_or_default());
+    cmd.env("ENVTOXML_CREATE", "1");
+    let out = cmd.output().expect("failed to run envtoxml");
+    assert!(out.status.success(), "ENVTOXML_CREATE=1 must enable create");
+    assert!(f.exists(), "file must be created via env knob");
+    let c = content(&f);
+    assert!(c.contains("<configuration>"));
+}
+
+#[test]
+fn create_mode_creates_parent_dir_if_missing() {
+    // The file path includes a parent dir that doesn't exist yet.
+    // --create should mkdir -p the parent (otherwise writing into
+    // a not-yet-created dir fails with ENOENT). This matches the
+    // entrypoint's typical usage where HADOOP_ETC may be a fresh
+    // mount point on first boot.
+    let dir = tempfile_dir();
+    let nested = dir.join("sub").join("not-yet").join("hdfs-site.xml");
+    assert!(!nested.exists());
+    let (ok, _, stderr) = run_create(&nested, &[("HDFS-SITE.XML_dfs.x", "1")]);
+    assert!(ok, "create+overrides in nested dir: {stderr}");
+    assert!(nested.exists());
+    let c = content(&nested);
+    assert!(c.contains("<name>dfs.x</name>"));
+}

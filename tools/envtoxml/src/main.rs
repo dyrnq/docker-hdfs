@@ -387,24 +387,87 @@ fn merge_file(file: &str, overrides: &[Override]) -> Result<(), String> {
     Ok(())
 }
 
+/// Minimal XML skeleton used by `--create` to bootstrap a new file.
+/// Wrapped to 80 cols here for source readability; the actual byte
+/// content is built as a single `concat!` below.
+const CREATE_SKELETON: &str = concat!(
+    "<?xml version=\"1.0\"?>\n",
+    "<configuration>\n",
+    "</configuration>\n",
+);
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: envtoxml <xml-file>");
+    // Parse args: optionally `--create` in argv[1], the file path in
+    // argv[2]. We accept `--create` as a flag (anywhere) for clarity
+    // and also recognize the `ENVTOXML_CREATE=1` env knob so the
+    // entrypoint can opt in without changing the argv shape.
+    let raw: Vec<String> = env::args().collect();
+    let mut create = env::var("ENVTOXML_CREATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let positional: Vec<&String> = raw
+        .iter()
+        .skip(1)
+        .filter(|a| {
+            if *a == "--create" {
+                create = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if positional.len() != 1 {
+        eprintln!("usage: envtoxml [--create] <xml-file>");
         eprintln!("  merges <NAME>.XML_<key>=<value> env vars into <name>.xml");
+        eprintln!("  --create: write a minimal <configuration/> if the file is missing");
         return ExitCode::from(2);
     }
-    let file = &args[1];
+    let file = positional[0];
     let Some(target) = target_name(file) else {
         eprintln!("envtoxml: {file} is not a *.xml config");
         return ExitCode::from(2);
     };
 
     let overrides = collect_overrides(&target);
-    // Fast path: nothing to do. Avoids reading/writing the file at all on
-    // the common boot where the operator passed no overrides.
+
+    // Fast path: no overrides. If --create is set AND the file is
+    // missing, write a minimal valid empty XML so subsequent boots
+    // (or the same boot, if Hadoop reads the file synchronously) see
+    // a well-formed skeleton. If the file already exists, do NOT
+    // touch it — that would be silent overwriting of an operator's
+    // own XML. If --create is NOT set, keep the original noop
+    // behavior (no read, no write) for backward compatibility.
     if overrides.is_empty() {
+        if create && !Path::new(file).exists() {
+            if let Err(e) = fs::write(file, CREATE_SKELETON) {
+                eprintln!("envtoxml: create {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+            eprintln!("envtoxml: created empty {file} (--create, no overrides)");
+        }
         return ExitCode::SUCCESS;
+    }
+
+    // Non-empty overrides: if the file is missing AND --create is
+    // set, bootstrap a skeleton so merge_file has something to read.
+    // (Without --create, the existing hard error is preserved —
+    // the operator passed an override for a file that doesn't
+    // exist, which is almost certainly a typo.)
+    if create && !Path::new(file).exists() {
+        if let Some(parent) = Path::new(file).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("envtoxml: mkdir {parent:?}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if let Err(e) = fs::write(file, CREATE_SKELETON) {
+            eprintln!("envtoxml: create {file}: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("envtoxml: created empty {file} (--create)");
     }
 
     match merge_file(file, &overrides) {
