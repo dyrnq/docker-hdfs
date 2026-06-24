@@ -9,11 +9,14 @@
 # Configurable timeouts (env override).
 #
 # The numbers below are ATTEMPT COUNTS, not wall-clock seconds.
-# Both hdfs_wait_for_kdc and hdfs_wait_for_namenode run one
-# attempt + 2s sleep, so the max wall clock is roughly
-# 2 × timeout. Defaults 30/60 therefore yield ~60s/~120s wall.
-# Keeping both env vars in the same unit (attempts) lets users
-# set both ceilings with consistent semantics.
+# hdfs_wait_for_kdc runs 1s nc -w + 1s sleep = ~2s per attempt;
+# hdfs_wait_for_namenode runs one dfsadmin + 2s sleep = ~3s per
+# attempt. So the max wall clocks differ: KDC ≈ 2 × timeout,
+# NN ≈ 3 × timeout. Defaults 30/60 therefore yield ~60s KDC
+# wall / ~180s NN wall. Keeping both env vars in the same
+# unit (attempts) lets users set both ceilings with consistent
+# semantics, but the KDC/NN wall-clock conversion factors are
+# documented per-helper below.
 # ---------------------------------------------------------------------------
 : "${HDFS_KDC_WAIT_TIMEOUT:=30}"
 : "${HDFS_NAMENODE_WAIT_TIMEOUT:=60}"
@@ -135,7 +138,13 @@ hdfs_kinit() {
     fi
 
     echo "[hdfs] keytab entries (klist -kt ${keytab}):"
-    gosu hdfs klist -kt "${keytab}" 2>&1 | sed 's/^/[hdfs]   /' || echo "[hdfs]   (klist failed; will still try kinit)"
+    # `if ! cmd | sed` keeps sed's exit-0 from masking klist's
+    # exit code. The previous `... || echo` form was dead code
+    # because sed always returned 0, so klist failures were
+    # silently swallowed (issue 4).
+    if ! gosu hdfs klist -kt "${keytab}" 2>&1 | sed 's/^/[hdfs]   /'; then
+        echo "[hdfs]   (klist failed; will still try kinit)"
+    fi
 
     # Stale ccache from a previous container run can confuse
     # subsequent kinit. `-A` clears all collections; `|| true`
