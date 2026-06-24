@@ -140,11 +140,13 @@ RUN set -eux; \
         useradd -u 1000 -g 1000 -m -s /bin/bash hdfs; \
     fi
 
-# krb5.conf + the Hadoop XML configs ship via the rootfs tree at
-# the bottom of this Dockerfile (`COPY rootfs /`) — see rootfs/
-# etc/krb5.conf and rootfs/opt/hadoop/etc/hadoop/{core,hdfs}-
-# site.xml. Single COPY for the whole app config; mirrors the
-# pattern in dyrnq/krb5-server.
+# krb5.conf ships via the rootfs tree at the bottom of this
+# Dockerfile (`COPY rootfs /`) — see rootfs/etc/krb5.conf.
+# core-site.xml / hdfs-site.xml are NOT in rootfs/; they are
+# produced at container start by the entrypoint's bash heredoc
+# + sed + envtoxml pipeline in rootfs/docker-entrypoint.sh
+# (functions hdfs_site_xml / core_site_xml). Single COPY for
+# the whole app config; mirrors the pattern in dyrnq/krb5-server.
 
 # Writable dirs for the hdfs user. Must exist at image build
 # time because some simple-auth deployments sidestep the entrypoint
