@@ -903,8 +903,22 @@ sed -i \
     printf 'export HDFS_SECONDARYNAMENODE_USER=hdfs\n'
     printf 'export HADOOP_OPTS="-Djava.security.krb5.conf=/etc/krb5.conf"\n'
     printf 'export HADOOP_HDFS_HOME=%s\n' "${HADOOP_HOME}"
-    printf 'export HDFS_KEYSTORE_PATH=%s\n' "${KEYSTORE}"
-    printf 'export HDFS_KEYSTORE_PASS=%s\n' "${KEYSTORE_PASS}"
+    # HDFS_KEYSTORE_PATH/PASS only get written when the keystore
+    # was actually generated — i.e. kerberos mode. In simple mode
+    # the file pointed at by ${KEYSTORE} does NOT exist, and
+    # Hadoop is supposed to skip the keystore because the
+    # simple-mode auto-strip sets dfs.http.policy=HTTP_ONLY. But
+    # writing a path to a nonexistent file into hadoop-env.sh
+    # is a footgun: if an operator later flips dfs.http.policy
+    # to HTTPS_ONLY (via -e HDFS-SITE.XML_dfs.http.policy=…)
+    # without realizing the keystore was never generated, Hadoop
+    # fails to start with a confusing FileNotFoundException. Keep
+    # the in-image env contract honest by only emitting the vars
+    # when the keystore actually exists (issue 3).
+    if [ -f "${KEYSTORE}" ]; then
+        printf 'export HDFS_KEYSTORE_PATH=%s\n' "${KEYSTORE}"
+        printf 'export HDFS_KEYSTORE_PASS=%s\n' "${KEYSTORE_PASS}"
+    fi
 } >> "${HADOOP_ETC}/hadoop-env.sh"
 
 # ---------------------------------------------------------------------------
