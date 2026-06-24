@@ -91,6 +91,7 @@ make build-ubuntu up-ubuntu
 | `HDFS_NAMENODE_WAIT_TIMEOUT` | no       | `60`         | Number of attempts (≈2× wall seconds) the datanode run script polls `dfsadmin -report` for, before giving up with a FATAL log line. |
 | `KEYSTORE_PASS`              | no       | `changeit`   | HTTPS self-signed keystore password. Ignored in simple mode (no keystore generated). |
 | `HDFS_DISABLE_ENVTOXML`      | no       | `0`          | Opt-out from the `<NAME>.XML_<key>` env-var injection (envtoxml pass). `=1` keeps the heredoc render + sed placeholder substitution but skips envtoxml entirely, so operator-supplied env vars do NOT mutate the rendered `hdfs-site.xml` / `core-site.xml`. Useful when an operator wants the heredoc defaults but does NOT want their `HDFS-SITE.XML_*` env vars to silently override them (no need to bind-mount `:ro`). **Interaction with simple mode**: the simple-mode auto-strip (issues #13, #14) is implemented INSIDE the envtoxml pass — disabling envtoxml in simple mode leaves the kerberos-only properties (`*kerberos.principal`, `*.keytab.file`, `dfs.data.transfer.protection`, `hadoop.rpc.protection`, etc.) in the rendered XML, and the NN/DN run scripts will fail to start (no KDC, but the XML says SASL is required). The entrypoint prints a loud `WARN:` to stderr for this combination; check `docker logs <name>` if you opt in to this combo and the daemons loop-restart. Bind-mounting your own XML (`:ro` or `:rw` — both are respected) is the alternative escape hatch if you need to skip envtoxml AND have a clean simple-mode XML. |
+| `JAVA_TOOL_OPTIONS`           | no       | `-Djava.net.preferIPv4Stack=true` | JVM-wide socket stack preference, baked in via `ENV` in `Dockerfile.debian` / `Dockerfile.ubuntu` (and their `.mirror` siblings). With this default, every JVM in the container opens AF_INET sockets only — no IPv6 wildcard `[::]:port` LISTENs on dual-stack hosts where `net.ipv6.bindv6only=0`, which is the root cause of issues #11, #12, and #15. The flag also makes `InetAddress.getByName` skip AAAA records, so `localhost` resolves to `127.0.0.1` only — fixes the DataNode info-web server `[::1]:0` `BindException` (issue #12) by default without an opt-in. **Runtime override**: `-e JAVA_TOOLUTIONS=-Djava.net.preferIPv4Stack=false` (or any other JVM flags) restores dual-stack — needed for IPv6-only clusters. **Build-time override**: `--build-arg JAVA_TOOLUTIONS=...` to bake a different default into your image. **Note**: the entrypoint's `hadoop-env.sh` render does NOT touch this var — it lives in `ENV` so the JVM picks it up directly. |
 
 ### Injecting arbitrary Hadoop XML config (`<NAME>.XML_<key>`)
 
@@ -619,23 +620,45 @@ In `datanode-only` mode (dynamic dep build test):
   resolves the DN hostname via A-only) got `ECONNREFUSED` on the
   registered IPv4 `ip_addr`. The image now ships
   `dfs.datanode.address=__HDFS_HOSTNAME__:port` (and the matching
-  `http-address` / `https-address`), which makes the DN bind a
-  **non-IPv6-wildcard** address — in practice an IPv4-mapped IPv6
-  socket on `::ffff:<resolved-ip>:port` in `/proc/net/tcp6`
-  (FFFF0000 prefix). The kernel still routes IPv4 input to that
-  socket on a dual-stack system, so IPv4 clients can connect; the
-  regression-test (smoke) verifies the bind is not the pure
-  `[::]:port` form. Note: this image does **not** ship
+  `http-address` / `https-address` / `ipc-address`),
+  **and** defaults `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true`
+  via the Dockerfile `ENV` block (see the `JAVA_TOOL_OPTIONS` row in
+  the env table above). The flag is the JVM-wide fix and supersedes
+  the hostname pattern for the dual-stack case; the hostname pattern
+  is kept as defensive coding so this property family is uniform
+  regardless of the JVM stack preference. Note: this image does
+  **not** ship
   `dfs.datanode.bind-host=0.0.0.0` — `DFS_DATANODE_BIND_HOST_KEY`
   does not exist in Hadoop 3.5.0 (only NN / Balancer / JournalNode
   / Provided-aliasmap have bind-host keys; DN does not), so the
   `hostname:port` pattern alone is what protects streaming + IPC +
-  HTTPS sockets. **k8s caveat** is the same as issue #8:
+  HTTPS sockets when an operator disables the default
+  `preferIPv4Stack=true`. **k8s caveat** is the same as issue #8:
   `HDFS_HOSTNAME` must resolve to the pod IP. Override at runtime
   with
   `-e HDFS-SITE.XML_dfs.datanode.address=<pod-ip>:<port> \
    -e HDFS-SITE.XML_dfs.datanode.http.address=<pod-ip>:9864 \
-   -e HDFS-SITE.XML_dfs.datanode.https.address=<pod-ip>:9865`.
+   -e HDFS-SITE.XML_dfs.datanode.https.address=<pod-ip>:9865 \
+   -e HDFS-SITE.XML_dfs.datanode.ipc.address=<pod-ip>:9867`.
+- **NameNode RPC / HTTP and DataNode IPC IPv6-only bind** (GitHub
+  issue #15): issue #11 covered DN data / HTTP / HTTPS; the same
+  root cause affects three more sockets — NN RPC (8020), NN HTTP
+  (9870), and DN IPC (9867). On a dual-stack host, NN's
+  `dfs.namenode.rpc-bind-host=0.0.0.0` produces the same
+  `[::]:port` LISTEN in `/proc/net/tcp6` only; DN IPC was previously
+  left at its Hadoop default `0.0.0.0:9867` and hit the same trap.
+  The heredoc now also pins
+  `dfs.datanode.ipc.address=__HDFS_HOSTNAME__:9867`. NN RPC / HTTP
+  bind-host stays at `0.0.0.0` deliberately (the "listen on ALL
+  interfaces" semantic documented above for issue #8), so the
+  dual-stack bind there can only be avoided at the JVM level. The
+  `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true` Dockerfile
+  `ENV` is the canonical fix: every JVM in the container opens
+  AF_INET sockets only, so 8020 / 9870 bind `00000000:port` in
+  `/proc/net/tcp` and `/proc/net/tcp6` is empty. Operators on
+  IPv6-only clusters who need the IPv6 half of the dual-stack can
+  pass `-e JAVA_TOOLUTIONS=-Djava.net.preferIPv4Stack=false` at run
+  time to restore the pre-fix bind behavior.
 - **DataNode info-web server bind crash on IPv6-only pods** (GitHub
   issue #12, upstream bug): the DataNode opens an additional
   listener for the info web UI, separate from the data / IPC / HTTPS
@@ -650,19 +673,19 @@ In `datanode-only` mode (dynamic dep build test):
   `InetAddress.getByName("localhost")` returns `[::1]` first
   (`net.ipv6.bindv6only=0`), Jetty tries `bind([::1]:0)`, and the
   kernel returns `EADDRNOTAVAIL`. The DataNode then shuts down
-  (`BindException: Failed to bind to /[0:0:0:0:0:0:0:1]:0`). The
-  image does **not** default `preferIPv4Stack=true` — opt in per
-  container when you hit the crash:
-  ```bash
-  -e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true
-  ```
-  This forces `getByName("localhost")` to return `127.0.0.1` (always
-  routable in the pod's netns), so the info-web server binds
-  `127.0.0.1:<ephemeral>` and proceeds. The flag is JVM-wide, so
-  other daemons in the container (NN / KDC) also resolve hostnames
-  IPv4-first; they don't bind `localhost`, so it has no observable
-  effect on them. Once upstream fixes
-  `DatanodeHttpServer.java:122` (replacing `"localhost"` with
-  `DFS_DATANODE_BIND_HOST_KEY`-derived value), this opt-in can be
-  removed.
+  (`BindException: Failed to bind to /[0:0:0:0:0:0:0:1]:0`). **The
+  fix is now baked into the image** via
+  `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true` in the
+  Dockerfile `ENV` (see the env table above): the flag forces
+  `getByName("localhost")` to return `127.0.0.1` (always routable in
+  the pod's netns), so the info-web server binds
+  `127.0.0.1:<ephemeral>` and proceeds. No operator opt-in needed
+  any more. Operators who override `JAVA_TOOLUTIONS` back to
+  dual-stack will reintroduce the crash and must restore the flag
+  (either on their custom image's Dockerfile `ENV` or via
+  `-e JAVA_TOOLUTIONS=-Djava.net.preferIPv4Stack=true`). Once
+  upstream fixes `DatanodeHttpServer.java:122` (replacing
+  `"localhost"` with a `DFS_DATANODE_BIND_HOST_KEY`-derived value,
+  which still does NOT exist in Hadoop 3.5.0 — see issue #11), this
+  default can be revisited.
 

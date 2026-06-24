@@ -181,6 +181,17 @@ hdfs_site_xml() {
         that one IP. (NameNode.getRpcServerBindHost,
         NameNode.java ~line 743.)
 
+        Effective "ALL" scope note: with the image's default
+        JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true (set in the
+        Dockerfile ENV, see Dockerfile.debian / Dockerfile.ubuntu),
+        the JVM only opens AF_INET sockets, so "ALL interfaces" here
+        means "all IPv4 interfaces". Operators on IPv6-only clusters
+        who need the IPv6 half of the dual-stack can pass
+        `-e JAVA_TOOLUTIONS=-Djava.net.preferIPv4Stack=false` at run
+        time — that restores the JVM's dual-stack behavior and the
+        bind reverts to `[::]:port` in /proc/net/tcp6 (the issue #15
+        state this Dockerfile ENV prevents by default).
+
         k8s caveat: __HDFS_HOSTNAME__ must resolve to the pod IP from
         inside the pod. A short name mapped to 127.0.0.1 in /etc/hosts
         (a common k8s pod default) defeats this — use the pod's
@@ -215,11 +226,12 @@ hdfs_site_xml() {
     -->
     <property><name>dfs.datanode.hostname</name><value>__HDFS_HOSTNAME__</value></property>
     <!--
-        DataNode address binding (issue #11):
-        The address + http-address + https-address values are set to
-        __HDFS_HOSTNAME__:port, NOT 0.0.0.0:port. This mirrors the
-        NN rpc-address fix above (issue #8) and addresses a separate
-        regression on IPv6-first JVMs (Debian 13 + OpenJDK 21).
+        DataNode address binding (issue #11, extended for issue #15):
+        The address + http-address + https-address + ipc-address values
+        are set to __HDFS_HOSTNAME__:port, NOT 0.0.0.0:port. This
+        mirrors the NN rpc-address fix above (issue #8) and addresses
+        a separate regression on IPv6-first JVMs (Debian 13 +
+        OpenJDK 21).
 
         Background: when a Java NIO ServerSocket binds "0.0.0.0",
         `InetSocketAddress` calls `getAllByName("0.0.0.0")`. On a system
@@ -237,6 +249,21 @@ hdfs_site_xml() {
         IPv6 wildcard, and `dfsadmin -report` / /proc/net/tcp[6] no
         longer report an IPv6-only listener.
 
+        ipc-address (9867) was previously left at its Hadoop default
+        `0.0.0.0:9867`, which made the DN IPC bind as the pure IPv6
+        wildcard dual-stack on the same Debian 13 / OpenJDK 21 systems
+        that prompted issue #11. The hostname pattern below brings
+        it into the same IPv4-mapped IPv6 family as data / http /
+        https. With the image's default
+        `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true` (set in
+        the Dockerfile ENV — see Dockerfile.debian / Dockerfile.ubuntu),
+        hostname resolution also skips AAAA records, so even if the
+        hostname pattern fell back to 0.0.0.0 (the k8s /etc/hosts
+        pitfall noted on rpc-address above) the bind would still
+        resolve as `00000000:268B` in /proc/net/tcp. The hostname
+        pattern stays here as defensive coding so this property
+        family is uniform regardless of the JVM stack preference.
+
         Note on `dfs.datanode.bind-host`: that config does NOT exist
         in Hadoop 3.5.0 — `DFSConfigKeys.DFS_DATANODE_BIND_HOST_KEY`
         is absent (only NN / Balancer / JournalNode / Provided-aliasmap
@@ -244,30 +271,19 @@ hdfs_site_xml() {
         the hostname-pattern above alone; a `bind-host` line here
         would be silently ignored. Don't reintroduce it.
 
-        Caveat — info web server (issue #12, upstream):
-        DataNode also opens an internal Jetty for the info web UI
-        (different code path). DatanodeHttpServer.java hard-codes
-        `addEndpoint(URI.create("http://localhost:" + proxyPort))`,
-        so on Debian 13 + OpenJDK 21 + k8s hostNetwork pods whose
-        netns has no `[::1]` route, the DN crashes with
-        `BindException: Cannot assign requested address` on
-        `[::1]:0`. The image does NOT default
-        `JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true` — users
-        hit by #12 opt in with
-        `-e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true` at
-        run time (see README).
-
         k8s caveat: same as rpc-address — __HDFS_HOSTNAME__ must
         resolve to the pod IP from inside the pod. Override at
         runtime via env:
         HDFS-SITE.XML_dfs.datanode.address=<ip>:<port>
         + HDFS-SITE.XML_dfs.datanode.http.address=<ip>:9864
         + HDFS-SITE.XML_dfs.datanode.https.address=<ip>:9865
+        + HDFS-SITE.XML_dfs.datanode.ipc.address=<ip>:9867
         (envtoxml is the documented escape hatch; see README).
     -->
     <property><name>dfs.datanode.address</name><value>__HDFS_HOSTNAME__:9866</value></property>
     <property><name>dfs.datanode.http.address</name><value>__HDFS_HOSTNAME__:9864</value></property>
     <property><name>dfs.datanode.https.address</name><value>__HDFS_HOSTNAME__:9865</value></property>
+    <property><name>dfs.datanode.ipc.address</name><value>__HDFS_HOSTNAME__:9867</value></property>
 
     <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/__HDFS_HOSTNAME__@__KRB5_REALM__</value></property>
     <property><name>dfs.web.authentication.kerberos.keytab</name><value>/etc/hadoop/hdfs.keytab</value></property>

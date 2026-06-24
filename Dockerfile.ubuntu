@@ -8,6 +8,17 @@ ARG HADOOP_VERSION=3.5.0
 # address than the one in the service principal and SASL auth fails
 # with "Connection reset by peer".
 ARG HDFS_HOSTNAME=hdfs.test
+# JVM-wide socket stack preference. Default to IPv4-only so that
+# `InetSocketAddress("0.0.0.0", port)` binds via AF_INET instead of
+# IPv6-first wildcard `[::]:port` (the JVM returns the IPv6 wildcard
+# first when net.ipv6.bindv6only=0, the Linux default — see issues
+# #11, #12, #15). Runtime override via
+#   -e JAVA_TOOLUTIONS=-Djava.net.preferIPv4Stack=false
+# to restore dual-stack on IPv6-only clusters. Build-time override
+# via `--build-arg JAVA_TOOLUTIONS=...`. This is the JVM env var
+# (read by `java` itself, not by hadoop-env.sh), so it lives here
+# rather than in the entrypoint's hadoop-env.sh idempotent render.
+ARG JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true
 
 # ---------------------------------------------------------------------------
 # Builder stage: compile the env→XML merger (`envtoxml`) to a static musl
@@ -43,6 +54,7 @@ ARG S6_OVERLAY_VERSION
 ARG HADOOP_VERSION
 ARG HDFS_HOSTNAME
 ARG UBUNTU_CODENAME
+ARG JAVA_TOOL_OPTIONS
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -51,7 +63,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/hadoop/bin:/opt/hadoop/sbin:${PATH} \
     S6_OVERLAY_VERSION=${S6_OVERLAY_VERSION} \
     HADOOP_VERSION=${HADOOP_VERSION} \
-    HDFS_HOSTNAME=${HDFS_HOSTNAME}
+    HDFS_HOSTNAME=${HDFS_HOSTNAME} \
+    JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}
 
 # Ubuntu 24.04 (noble) and later ship apt sources in the deb822
 # format at /etc/apt/sources.list.d/ubuntu.sources with two stanzas:
